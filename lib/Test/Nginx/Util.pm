@@ -3,7 +3,7 @@ package Test::Nginx::Util;
 use strict;
 use warnings;
 
-our $VERSION = '0.08';
+our $VERSION = '0.09';
 
 use base 'Exporter';
 
@@ -13,6 +13,9 @@ use HTTP::Response;
 use Module::Install::Can;
 use Cwd qw( cwd );
 use List::Util qw( shuffle );
+use Time::HiRes qw( sleep );
+
+our $LatestNginxVersion = 0.008039;
 
 our $NoNginxManager = 0;
 our $Profiling = 0;
@@ -20,9 +23,17 @@ our $Profiling = 0;
 our $RepeatEach = 1;
 our $MAX_PROCESSES = 10;
 
+our $NoShuffle = 0;
+
+our $UseValgrind = $ENV{TEST_NGINX_USE_VALGRIND};
+
+sub no_shuffle () {
+    $NoShuffle = 1;
+}
+
 our $ForkManager;
 
-if ($Profiling) {
+if ($Profiling || $UseValgrind) {
     eval "use Parallel::ForkManager";
     if ($@) {
         die "Failed to load Parallel::ForkManager: $@\n";
@@ -36,7 +47,8 @@ our $LogLevel               = 'debug';
 our $MasterProcessEnabled   = 'off';
 our $DaemonEnabled          = 'on';
 our $ServerPort             = 1984;
-our $ServerPortForClient    = 1984;
+our $ServerPortForClient    = $ENV{TEST_NGINX_CLIENT_PORT} || 1984;
+our $NoRootLocation = 0;
 #our $ServerPortForClient    = 1984;
 
 
@@ -54,6 +66,10 @@ sub worker_connections (@) {
     } else {
         return $WorkerConnections;
     }
+}
+
+sub no_root_location () {
+    $NoRootLocation = 1;
 }
 
 sub workers (@) {
@@ -110,10 +126,12 @@ our @EXPORT_OK = qw(
     repeat_each
     master_process_enabled
     log_level
+    no_shuffle
+    no_root_location
 );
 
 
-if ($Profiling) {
+if ($Profiling || $UseValgrind) {
     $DaemonEnabled          = 'off';
     $MasterProcessEnabled   = 'off';
 }
@@ -148,13 +166,13 @@ sub run_tests () {
         #warn "[INFO] Using nginx version $NginxVersion ($NginxRawVersion)\n";
     }
 
-    for my $block (shuffle Test::Base::blocks()) {
+    for my $block ($NoShuffle ? Test::Base::blocks() : shuffle Test::Base::blocks()) {
         #for (1..3) {
             run_test($block);
         #}
     }
 
-    if ($Profiling) {
+    if ($Profiling || $UseValgrind) {
         $ForkManager->wait_all_children;
     }
 }
@@ -187,6 +205,51 @@ sub setup_server_root () {
         die "Failed to do mkdir $ConfDir\n";
 }
 
+sub write_user_files ($) {
+    my $block = shift;
+
+    my $name = $block->name;
+
+    if ($block->user_files) {
+        my $raw = $block->user_files;
+
+        open my $in, '<', \$raw;
+
+        my @files;
+        my ($fname, $body);
+        while (<$in>) {
+            if (/>>> (\S+)/) {
+                if ($fname) {
+                    push @files, [$fname, $body];
+                }
+
+                $fname = $1;
+                undef $body;
+            } else {
+                $body .= $_;
+            }
+        }
+
+        if ($fname) {
+            push @files, [$fname, $body];
+        }
+
+        for my $file (@files) {
+            my ($fname, $body) = @$file;
+            #warn "write file $fname with content [$body]\n";
+
+            if (!defined $body) {
+                $body = '';
+            }
+
+            open my $out, ">$HtmlDir/$fname" or
+                die "$name - Cannot open $HtmlDir/$fname for writing: $!\n";
+            print $out $body;
+            close $out;
+        }
+    }
+}
+
 sub write_config_file ($$) {
     my ($config, $http_config) = @_;
 
@@ -213,11 +276,11 @@ http {
     default_type text/plain;
     keepalive_timeout  68;
 
-    $http_config
+$http_config
 
     server {
         listen          $ServerPort;
-        server_name     localhost;
+        server_name     'localhost';
 
         client_max_body_size 30M;
         #client_body_buffer_size 4k;
@@ -230,10 +293,18 @@ $ConfigPreamble
 $config
         # End test case config.
 
+_EOC_
+
+    if (! $NoRootLocation) {
+        print $out <<_EOC_;
         location / {
             root $HtmlDir;
             index index.html index.htm;
         }
+_EOC_
+    }
+
+    print $out <<_EOC_;
     }
 }
 
@@ -293,8 +364,14 @@ sub parse_headers ($) {
     open my $in, '<', \$s;
     while (<$in>) {
         s/^\s+|\s+$//g;
-        my ($key, $val) = split /\s*:\s*/, $_, 2;
-        $headers{$key} = $val;
+        my $neg = ($_ =~ s/^!\s*//);
+        #warn "neg: $neg ($_)";
+        if ($neg) {
+            $headers{$_} = undef;
+        } else {
+            my ($key, $val) = split /\s*:\s*/, $_, 2;
+            $headers{$key} = $val;
+        }
     }
     close $in;
     return \%headers;
@@ -312,6 +389,7 @@ sub run_test ($) {
     }
 
     my $skip_nginx = $block->skip_nginx;
+    my $skip_nginx2 = $block->skip_nginx2;
     my ($tests_to_skip, $should_skip, $skip_reason);
     if (defined $skip_nginx) {
         if ($skip_nginx =~ m{
@@ -334,7 +412,37 @@ sub run_test ($) {
                 $skip_nginx);
             die;
         }
+    } elsif (defined $skip_nginx2) {
+        if ($skip_nginx2 =~ m{
+                ^ \s* (\d+) \s* : \s*
+                    ([<>]=?) \s* (\d+)\.(\d+)\.(\d+)
+                    \s* (or|and) \s*
+                    ([<>]=?) \s* (\d+)\.(\d+)\.(\d+)
+                    (?: \s* : \s* (.*) )?
+                \s*$}x) {
+            $tests_to_skip = $1;
+            my ($opa, $ver1a, $ver2a, $ver3a) = ($2, $3, $4, $5);
+            my $opx = $6;
+            my ($opb, $ver1b, $ver2b, $ver3b) = ($7, $8, $9, $10);
+            $skip_reason = $11;
+            my $vera = get_canon_version($ver1a, $ver2a, $ver3a);
+            my $verb = get_canon_version($ver1b, $ver2b, $ver3b);
+
+            if ((!defined $NginxVersion)
+                or (($opx eq "or") and (eval "$NginxVersion $opa $vera"
+                                        or eval "$NginxVersion $opb $verb"))
+                or (($opx eq "and") and (eval "$NginxVersion $opa $vera"
+                                        and eval "$NginxVersion $opb $verb")))
+            {
+                $should_skip = 1;
+            }
+        } else {
+            Test::More::BAIL_OUT("$name - Invalid --- skip_nginx2 spec: " .
+                $skip_nginx2);
+            die;
+        }
     }
+
     if (!defined $skip_reason) {
         $skip_reason = "various reasons";
     }
@@ -404,6 +512,7 @@ start_nginx:
 
             #warn "*** Restarting the nginx server...\n";
             setup_server_root();
+            write_user_files($block);
             write_config_file($config, $block->http_config);
             if ( ! Module::Install::Can->can_run('nginx') ) {
                 Test::More::BAIL_OUT("$name - Cannot find the nginx executable in the PATH environment");
@@ -413,6 +522,10 @@ start_nginx:
         #Test::More::BAIL_OUT("$name - Invalid config file");
         #}
         #my $cmd = "nginx -p $ServRoot -c $ConfFile > /dev/null";
+            if (!defined $NginxVersion) {
+                $NginxVersion = $LatestNginxVersion;
+            }
+
             my $cmd;
             if ($NginxVersion >= 0.007053) {
                 $cmd = "nginx -p $ServRoot/ -c $ConfFile > /dev/null";
@@ -420,16 +533,38 @@ start_nginx:
                 $cmd = "nginx -c $ConfFile > /dev/null";
             }
 
-            if ($Profiling) {
+            if ($UseValgrind) {
+                if (-f 'valgrind.suppress') {
+                    $cmd = "valgrind -q --leak-check=full --gen-suppressions=all --suppressions=valgrind.suppress $cmd";
+                } else {
+                    $cmd = "valgrind -q --leak-check=full --gen-suppressions=all $cmd";
+                }
+
+                warn "$name\n";
+                #warn "$cmd\n";
+            }
+
+            if ($Profiling || $UseValgrind) {
                 my $pid = $ForkManager->start;
                 if (!$pid) {
                     # child process
+                    exec $cmd;
+
+=begin cmt
+
                     if (system($cmd) != 0) {
                         Test::More::BAIL_OUT("$name - Cannot start nginx using command \"$cmd\".");
                     }
 
                     $ForkManager->finish; # terminate the child process
+
+=end cmt
+
+=cut
+
                 }
+                #warn "sleeping";
+                sleep 1;
             } else {
                 if (system($cmd) != 0) {
                     Test::More::BAIL_OUT("$name - Cannot start nginx using command \"$cmd\".");
@@ -437,6 +572,13 @@ start_nginx:
             }
 
             sleep 0.1;
+        }
+    }
+
+    if ($block->init) {
+        eval $block->init;
+        if ($@) {
+            Test::More::BAIL_OUT("$name - init failed: $@");
         }
     }
 
@@ -459,12 +601,39 @@ start_nginx:
         }
     }
 
-    if (defined $block->quit && $Profiling) {
-        warn "Found quit...";
+    if ($Profiling || $UseValgrind) {
+        #warn "Found quit...";
         if (-f $PidFile) {
+            #warn "found pid file...";
             my $pid = get_pid_from_pidfile($name);
             if (system("ps $pid > /dev/null") == 0) {
                 write_config_file($config, $block->http_config);
+                if (kill(SIGQUIT, $pid) == 0) { # send quit signal
+                    warn("$name - Failed to send quit signal to the nginx process with PID $pid");
+                }
+                sleep 0.1;
+                if (-f $PidFile) {
+                    #warn "killing with force (valgrind or profile)...\n";
+                    kill(SIGKILL, $pid);
+                    sleep 0.02;
+                } else {
+                    #warn "nginx killed";
+                }
+            } else {
+                unlink $PidFile or
+                    die "Failed to remove pid file $PidFile\n";
+            }
+        } else {
+            #warn "pid file not found";
+        }
+    }
+}
+
+END {
+    if ($UseValgrind) {
+        if (-f $PidFile) {
+            my $pid = get_pid_from_pidfile('');
+            if (system("ps $pid > /dev/null") == 0) {
                 if (kill(SIGQUIT, $pid) == 0) { # send quit signal
                     #warn("$name - Failed to send quit signal to the nginx process with PID $pid");
                 }
@@ -475,8 +644,7 @@ start_nginx:
                     sleep 0.02;
                 }
             } else {
-                unlink $PidFile or
-                    die "Failed to remove pid file $PidFile\n";
+                unlink $PidFile;
             }
         }
     }

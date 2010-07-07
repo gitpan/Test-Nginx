@@ -5,14 +5,16 @@ use lib 'inc';
 
 use Test::Base -Base;
 
-our $VERSION = '0.08';
+our $VERSION = '0.09';
 
+use Encode;
 use Data::Dumper;
 use Time::HiRes qw(sleep time);
 use Test::LongString;
 use List::MoreUtils qw( any );
 use IO::Select ();
 
+our $ServerAddr = 'localhost';
 our $Timeout = 2;
 
 use Test::Nginx::Util qw(
@@ -38,6 +40,8 @@ use Test::Nginx::Util qw(
     workers
     master_on
     log_level
+    no_shuffle
+    no_root_location
 );
 
 #use Smart::Comments::JSON '###';
@@ -53,9 +57,11 @@ our @EXPORT = qw( plan run_tests run_test
     repeat_each config_preamble worker_connections
     master_process_enabled
     no_long_string workers master_on
-    log_level);
+    log_level no_shuffle no_root_location
+    server_addr
+);
 
-sub send_request ($$$);
+sub send_request ($$$$);
 
 sub run_test_helper ($);
 
@@ -65,6 +71,15 @@ sub write_event_handler ($);
 
 sub no_long_string () {
     $NoLongString = 1;
+}
+
+sub server_addr (@) {
+    if (@_) {
+        #warn "setting server addr to $_[0]\n";
+        $ServerAddr = shift;
+    } else {
+        return $ServerAddr;
+    }
 }
 
 $RunTestHelper = \&run_test_helper;
@@ -199,9 +214,16 @@ $parsed_req->{content}";
     }
 
     my $raw_resp = send_request($req, $block->raw_request_middle_delay,
-        $timeout);
+        $timeout, $block->name);
 
     #warn "raw resonse: [$raw_resp]\n";
+
+    my $raw_headers = '';
+    if ($raw_resp =~ /(.*?)\r\n\r\n/s) {
+        #warn "\$1: $1";
+        $raw_headers = $1;
+    }
+    #warn "raw headers: $raw_headers\n";
 
     my $res = HTTP::Response->parse($raw_resp);
     my $enc = $res->header('Transfer-Encoding');
@@ -243,7 +265,7 @@ $parsed_req->{content}";
                 fail "$name - invalid chunked body received: $&";
                 return;
             } else {
-                fail "$name - no last chunk found";
+                fail "$name - no last chunk found - $raw";
                 return;
             }
         }
@@ -260,11 +282,18 @@ $parsed_req->{content}";
     if (defined $block->response_headers) {
         my $headers = parse_headers($block->response_headers);
         while (my ($key, $val) = each %$headers) {
-            my $expected_val = $res->header($key);
-            if (!defined $expected_val) {
-                $expected_val = '';
+            if (!defined $val) {
+                #warn "HIT";
+                unlike $raw_headers, qr/^\s*\Q$key\E\s*:/ms, "$name - header $key not present in the raw headers";
+                next;
             }
-            is $expected_val, $val,
+
+            my $actual_val = $res->header($key);
+            if (!defined $actual_val) {
+                $actual_val = '';
+            }
+
+            is $actual_val, $val,
                 "$name - header $key ok";
         }
     } elsif (defined $block->response_headers_like) {
@@ -297,6 +326,10 @@ $parsed_req->{content}";
             $expected = $block->response_body;
         }
 
+        if ($block->charset) {
+            Encode::from_to($expected, 'UTF-8', $block->charset);
+        }
+
         $expected =~ s/\$ServerPort\b/$ServerPort/g;
         $expected =~ s/\$ServerPortForClient\b/$ServerPortForClient/g;
         #warn show_all_chars($content);
@@ -322,16 +355,17 @@ $parsed_req->{content}";
     }
 }
 
-sub send_request ($$$) {
-    my ($req, $middle_delay, $timeout) = @_;
+sub send_request ($$$$) {
+    my ($req, $middle_delay, $timeout, $name) = @_;
 
     my @req_bits = ref $req ? @$req : ($req);
 
     my $sock = IO::Socket::INET->new(
-        PeerAddr => 'localhost',
+        PeerAddr => $ServerAddr,
         PeerPort => $ServerPortForClient,
         Proto    => 'tcp'
-    ) or die "Can't connect to localhost:$ServerPortForClient: $!\n";
+    ) or
+        die "Can't connect to $ServerAddr:$ServerPortForClient: $!\n";
 
     my $flags = fcntl $sock, F_GETFL, 0
         or die "Failed to get flags: $!\n";
@@ -347,6 +381,7 @@ sub send_request ($$$) {
         write_buf => shift @req_bits,
         middle_delay => $middle_delay,
         sock => $sock,
+        name => $name,
     };
 
     my $readable_hdls = IO::Select->new($sock);
@@ -469,7 +504,8 @@ sub send_request ($$$) {
 }
 
 sub timeout_event_handler ($) {
-    warn "socket client: timed out";
+    my $ctx = shift;
+    warn "ERROR: socket client: timed out - $ctx->{name}\n";
 }
 
 sub error_event_handler ($) {
@@ -672,6 +708,12 @@ The following sections are supported:
 =item error_code
 
 =item raw_request
+
+=item user_files
+
+=item skip_nginx
+
+=item skip_nginx2
 
 Both string scalar and string arrays are supported as values.
 
