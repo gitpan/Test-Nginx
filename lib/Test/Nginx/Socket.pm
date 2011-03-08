@@ -5,7 +5,7 @@ use lib 'inc';
 
 use Test::Base -Base;
 
-our $VERSION = '0.11';
+our $VERSION = '0.12';
 
 use Encode;
 use Data::Dumper;
@@ -45,6 +45,7 @@ use Test::Nginx::Util qw(
     server_root
     html_dir
     server_port
+    no_nginx_manager
 );
 
 #use Smart::Comments::JSON '###';
@@ -62,7 +63,7 @@ our @EXPORT = qw( plan run_tests run_test
     no_long_string workers master_on
     log_level no_shuffle no_root_location
     server_addr server_root html_dir server_port
-    timeout
+    timeout no_nginx_manager
 );
 
 sub send_request ($$$$);
@@ -300,6 +301,16 @@ $parsed_req->{content}";
             is($res->code || '', $block->error_code, "$name - status code ok");
         } else {
             is($res->code || '', 200, "$name - status code ok");
+        }
+    }
+
+    if (defined $block->raw_response_headers_like) {
+        if ($dry_run) {
+            Test::More::skip("$name - tests skipped due to the lack of directive $dry_run", 1);
+
+        } else {
+            my $expected = $block->raw_response_headers_like;
+            like $raw_headers, qr/$expected/s, "$name - raw resp headers like";
         }
     }
 
@@ -860,9 +871,9 @@ agentzh (章亦春) C<< <agentzh@gmail.com> >>
 
 =head1 COPYRIGHT & LICENSE
 
-Copyright (c) 2009, Taobao Inc., Alibaba Group (L<http://www.taobao.com>).
+Copyright (c) 2009-2011, Taobao Inc., Alibaba Group (L<http://www.taobao.com>).
 
-Copyright (c) 2009, agentzh C<< <agentzh@gmail.com> >>.
+Copyright (c) 2009-2011, agentzh C<< <agentzh@gmail.com> >>.
 
 This module is licensed under the terms of the BSD license.
 
