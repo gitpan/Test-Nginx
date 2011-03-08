@@ -1,5 +1,8 @@
 Changes for Test::Nginx
 
+0.13 - 2011-03-08
+* documented the TEST_NGINX_PORT environment.
+
 0.12 - 2011-03-08
 * documented the etcproxy and valgrind integration support.
 * implemented the no_nginx_manager utility function
