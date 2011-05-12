@@ -3,7 +3,7 @@ package Test::Nginx::Util;
 use strict;
 use warnings;
 
-our $VERSION = '0.13';
+our $VERSION = '0.14';
 
 use base 'Exporter';
 
@@ -17,7 +17,7 @@ use ExtUtils::MakeMaker ();
 
 our $LatestNginxVersion = 0.008039;
 
-our $NoNginxManager = 0;
+our $NoNginxManager = $ENV{TEST_NGINX_NO_NGINX_MANAGER} || 0;
 our $Profiling = 0;
 
 our $RepeatEach = 1;
@@ -56,6 +56,8 @@ our $ServerPortForClient    = $ENV{TEST_NGINX_CLIENT_PORT} || $ENV{TEST_NGINX_PO
 our $NoRootLocation         = 0;
 our $TestNginxSleep         = $ENV{TEST_NGINX_SLEEP} || 0;
 our $BuildSlaveName         = $ENV{TEST_NGINX_BUILDSLAVE};
+our $ForceRestartOnTest     = (defined $ENV{TEST_NGINX_FORCE_RESTART_ON_TEST})
+                               ? $ENV{TEST_NGINX_FORCE_RESTART_ON_TEST} : 1;
 
 sub server_port (@) {
     if (@_) {
@@ -165,7 +167,8 @@ our $NginxVersion;
 our $NginxRawVersion;
 our $TODO;
 
-#our ($PrevRequest, $PrevConfig);
+#our ($PrevRequest)
+our $PrevConfig;
 
 our $ServRoot   = $ENV{TEST_NGINX_SERVROOT} || File::Spec->catfile(cwd() || '.', 't/servroot');
 our $LogDir     = File::Spec->catfile($ServRoot, 'logs');
@@ -382,6 +385,7 @@ sub get_pid_from_pidfile ($) {
     open my $in, $PidFile or
         bail_out("$name - Failed to open the pid file $PidFile for reading: $!");
     my $pid = do { local $/; <$in> };
+    chomp $pid;
     #warn "Pid: $pid\n";
     close $in;
     return $pid;
@@ -465,11 +469,42 @@ sub run_test ($) {
     $config = expand_env_in_config($config);
 
     my $dry_run = 0;
+    my $should_restart = 1;
+    my $should_reconfig = 1;
 
     if (!defined $config) {
-        bail_out("$name - No '--- config' section specified");
-        #$config = $PrevConfig;
-        die;
+        if (!$NoNginxManager) {
+            # Manager without config.
+            if (!defined $PrevConfig) {
+                bail_out("$name - No '--- config' section specified and could not get previous one. Use TEST_NGINX_NO_NGINX_MANAGER ?");
+                die;
+            }
+            $should_reconfig = 0; # There is nothing to reconfig to.
+            $should_restart = $ForceRestartOnTest;
+        }
+        # else: not manager without a config. This is not a problem at all.
+        # setting these values to something meaningful but should not be used
+        $should_restart = 0;
+        $should_reconfig = 0;
+    } elsif ($NoNginxManager) {
+        # One config but not manager: it's worth a warning.
+        Test::Base::diag("NO_NGINX_MANAGER activated: config for $name ignored");
+        # Like above: setting them to something meaningful just in case.
+        $should_restart = 0;
+        $should_reconfig = 0;
+    } else {
+        # One config and manager. Restart only if forced to or if config
+        # changed.
+        if ((!defined $PrevConfig) || ($config ne $PrevConfig)) {
+            $should_reconfig = 1;
+        } else {
+            $should_reconfig = 0;
+        }
+        if ($should_reconfig || $ForceRestartOnTest) {
+            $should_restart = 1;
+        } else {
+            $should_restart = 0;
+        }
     }
 
     my $skip_nginx = $block->skip_nginx;
@@ -581,7 +616,10 @@ sub run_test ($) {
         $todo_reason = "various reasons";
     }
 
-    if (!$NoNginxManager && !$should_skip) {
+    if (!$NoNginxManager && !$should_skip && $should_restart) {
+        if ($should_reconfig) {
+            $PrevConfig = $config;
+        }
         my $nginx_is_running = 1;
         if (-f $PidFile) {
             my $pid = get_pid_from_pidfile($name);
