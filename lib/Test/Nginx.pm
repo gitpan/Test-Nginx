@@ -3,7 +3,7 @@ package Test::Nginx;
 use strict;
 use warnings;
 
-our $VERSION = '0.14';
+our $VERSION = '0.15';
 
 __END__
 
@@ -273,15 +273,19 @@ This module has a Git repository on Github, which has access for all.
 
 If you want a commit bit, feel free to drop me a line.
 
-=head1 AUTHOR
+=head1 AUTHORS
 
 agentzh (章亦春) C<< <agentzh@gmail.com> >>
+
+Antoine BONAVITA C<< <antoine.bonavita@gmail.com> >>
 
 =head1 COPYRIGHT & LICENSE
 
 Copyright (c) 2009-2011, Taobao Inc., Alibaba Group (L<http://www.taobao.com>).
 
 Copyright (c) 2009-2011, agentzh C<< <agentzh@gmail.com> >>.
+
+Copyright (c) 2011, Antoine Bonavita C<< <antoine.bonavita@gmail.com> >>.
 
 This module is licensed under the terms of the BSD license.
 

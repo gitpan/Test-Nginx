@@ -3,7 +3,7 @@ package Test::Nginx::Util;
 use strict;
 use warnings;
 
-our $VERSION = '0.14';
+our $VERSION = '0.15';
 
 use base 'Exporter';
 
@@ -804,6 +804,7 @@ start_nginx:
 
 END {
     if ($UseValgrind || !$ENV{TEST_NGINX_NO_CLEAN}) {
+        local $?; # to avoid confusing Test::Builder::_ending
         if (-f $PidFile) {
             my $pid = get_pid_from_pidfile('');
             if (!$pid) {
@@ -811,7 +812,7 @@ END {
             }
             if (system("ps $pid > /dev/null") == 0) {
                 if (kill(SIGQUIT, $pid) == 0) { # send quit signal
-                    #warn("$name - Failed to send quit signal to the nginx process with PID $pid");
+                    #warn("Failed to send quit signal to the nginx process with PID $pid");
                 }
                 if ($TestNginxSleep) {
                     sleep $TestNginxSleep;

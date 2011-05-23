@@ -5,13 +5,12 @@ use lib 'inc';
 
 use Test::Base -Base;
 
-our $VERSION = '0.14';
+our $VERSION = '0.15';
 
 use Encode;
 use Data::Dumper;
 use Time::HiRes qw(sleep time);
 use Test::LongString;
-use Test::More;
 use List::MoreUtils qw( any );
 use IO::Select ();
 
@@ -492,7 +491,16 @@ sub get_indexed_value($$$$) {
             Test::More::BAIL_OUT("$name - You asked for many requests, the expected results should be arrays as well.");
         }
     } else {
-        return $value;
+        # One element but still provided as an array.
+        if (ref $value && ref $value eq 'ARRAY') {
+            if ($req_idx != 0) {
+                Test::More::BAIL_OUT("$name - SHOULD NOT HAPPEN: idx!=0 and don't need array.");
+            } else {
+                return $$value[0];
+            }
+        } else {
+            return $value;
+        }
     }
 }
 sub check_error_code($$$$$) {
@@ -1077,6 +1085,7 @@ The following sections are supported:
 Content of this section will be included in the "server" part of the generated
 config file. This is the place where you want to put the "location" directive
 enabling the module you want to test. Example:
+
         location /echo {
             echo_before_body hello;
             echo world;
@@ -1093,6 +1102,7 @@ Please note that config section goes through environment variable expansion
 provided the variables to expand start with TEST_NGINX.
 So, the following is a perfectly legal (provided C<TEST_NGINX_HTML_DIR> is
 set correctly):
+
     location /main {
         echo_subrequest POST /sub -f $TEST_NGINX_HTML_DIR/blah.txt;
     }
@@ -1102,6 +1112,7 @@ set correctly):
 Content of this section will be included in the "http" part of the generated
 config file. This is the place where you want to put the "upstream" directive
 you might want to test. Example:
+
     upstream database {
         postgres_server     127.0.0.1:$TEST_NGINX_POSTGRESQL_PORT
                             dbname=ngx_test user=ngx_test
@@ -1127,6 +1138,7 @@ are going to send to the nginx server. It offers a pretty powerful grammar
 which we are going to walk through one example at a time.
 
 In its most basic form, this section looks like that:
+
     --- request
     GET
 
@@ -1135,6 +1147,7 @@ HTTP/1.1.
 
 Of course, you might want to test something else than the root of your
 web server and even use a different version of HTTP. This is possible:
+
     --- request
     GET /foo HTTP/1.0
 
@@ -1144,6 +1157,7 @@ C<Host> (with value localhost) and C<Connection> (with value Close for
 simple requests and keep-alive for all but the last pipelined_request).
 
 You can also add a content to your request:
+
     --- request
     POST /foo
     Hello world
@@ -1155,6 +1169,7 @@ This being said, as soon as you want to POST real data, you will be interested
 in using the more_headers section and using the power of Test::Base filters
 to urlencode the content you are sending. Which gives us a
 slightly more realistic example:
+
     --- more_headers
     Content-type: application/x-www-form-urlencoded
     --- request eval
@@ -1165,6 +1180,7 @@ slightly more realistic example:
 Sometimes a test is more than one request. Typically you want to POST some
 data and make sure the data has been taken into account with a GET. You can
 do it using arrays:
+
     --- request eval
     ["POST /users
     name=foo", "GET /users/foo"]
@@ -1174,6 +1190,7 @@ This way, REST-like interfaces are pretty easy to test.
 When you develop nifty nginx modules you will eventually want to test things
 with buffers and "weird" network conditions. This is where you split
 your request into network packets:
+
     --- request eval
     [["POST /users\nna", "me=foo"]]
 
@@ -1187,10 +1204,12 @@ C<syswrite>.
 
 A good way to make I<almost> sure the two calls result in two packets is to
 introduce a delay (let's say 2 seconds)before sending the second packet:
+
     --- request eval
     [["POST /users\nna", {value => "me=foo", delay_before => 2}]]
 
 Of course, everything can be combined till your brain starts boiling ;) :
+
     --- request eval
     use URI::Escape;
     my $val="value=".uri_escape("N:12346");
@@ -1203,12 +1222,14 @@ Of course, everything can be combined till your brain starts boiling ;) :
 
 Use of this section is deprecated and tests using it should replace it with
 a C<request> section with an C<eval> filter. More explicitly:
+
     --- request_eval
     "POST /echo_body
     hello\x00\x01\x02
     world\x03\x04\xff"
 
 should be replaced by:
+
     --- request eval
     "POST /echo_body
     hello\x00\x01\x02
@@ -1217,6 +1238,7 @@ should be replaced by:
 =head2 more_headers
 
 Adds the content of this section as headers to the request being sent. Example:
+
     --- more_headers
     X-Foo: blah
 
@@ -1227,12 +1249,14 @@ C<Content-Length>).
 =head2 response_body
 
 The expected value for the body of the submitted request.
+
     --- response_body
     hello
 
 If the test is made of multiple requests, then the response_body B<MUST>
 be an array and each request B<MUST> return the corresponding expected
 body:
+
     --- request eval
     ["GET /hello", "GET /world"]
     --- response_body eval
@@ -1242,11 +1266,13 @@ body:
 
 Use of this section is deprecated and tests using it should replace it
 with a C<request> section with an C<eval> filter. Therefore:
+
     --- response_body_eval
     "hello\x00\x01\x02
     world\x03\x04\xff"
 
 should be replaced by:
+
     --- response_body eval
     "hello\x00\x01\x02
     world\x03\x04\xff"
@@ -1255,6 +1281,7 @@ should be replaced by:
 
 The body returned by the request MUST match the pattern provided by this
 section. Example:
+
     --- response_body_like
     ^elapsed 0\.00[0-5] sec\.$
 
@@ -1264,10 +1291,12 @@ be an array and each request B<MUST> match the corresponding pattern.
 =head2 response_headers
 
 The headers specified in this section are in the response sent by nginx.
+
     --- response_headers
     Content-Type: application/x-resty-dbd-stream
 
 Of course, you can specify many headers in this section:
+
     --- response_headers
     X-Resty-DBD-Module:
     Content-Type: application/x-resty-dbd-stream
@@ -1282,6 +1311,7 @@ response to the corresponding request.
 =head2 response_headers_like
 
 The value of the headers returned by nginx match the patterns.
+
     --- response_headers_like
     X-Resty-DBD-Module: ngx_drizzle \d+\.\d+\.\d+
     Content-Type: application/x-resty-dbd-stream
@@ -1303,6 +1333,7 @@ Checks the headers part of the response against this pattern. This is
 particularly useful when you want to write tests of redirect functions
 that are not bound to the value of the port your nginx server (under
 test) is listening to:
+
     --- raw_response_headers_like: Location: http://localhost(?::\d+)?/foo\r\n
 
 As usual, if the test is made of multiple requests, then
@@ -1312,6 +1343,7 @@ raw_response_headers_like B<MUST> be an array.
 
 The expected value of the HTTP response code. If not set, this is assumed
 to be 200. But you can expect other things such as a redirect:
+
     --- error_code: 302
 
 If the test is made of multiple requests, then
@@ -1323,6 +1355,7 @@ of each request in the test.
 The exact request to send to nginx. This is useful when you want to test
 soem behaviors that are not available with "request" such as an erroneous
 C<Content-Length> header or splitting packets right in the middle of headers:
+
     --- raw_request eval
     ["POST /rrd/taratata HTTP/1.1\r
     Host: localhost\r
@@ -1332,6 +1365,7 @@ C<Content-Length> header or splitting packets right in the middle of headers:
     Content-Length:15\r\n\r\nvalue=N%3A12345"]
 
 This can also be useful to tests "invalid" request lines:
+
     --- raw_request
     GET /foo HTTP/2.0 THE_FUTURE_IS_NOW
 
@@ -1339,6 +1373,7 @@ This can also be useful to tests "invalid" request lines:
 
 With this section you can create a file that will be copied in the
 html directory of the nginx server under test. For example:
+
     --- user_files
     >>> blah.txt
     Hello, world
@@ -1356,6 +1391,97 @@ Both string scalar and string arrays are supported as values.
 
 Delay in sec between sending successive packets in the "raw_request" array
 value. Also used when a request is split in packets.
+
+=head1 Environment variables
+
+All environment variables starting with C<TEST_NGINX_> are expanded in the
+sections used to build the configuration of the server that tests automatically
+starts. The following environment variables are supported by this module:
+
+=head2 TEST_NGINX_NO_NGINX_MANAGER
+
+Defaults to 0. If set to 1, Test::Nginx module will not manage
+(configure/start/stop) the C<nginx> process. Can be useful to run tests
+against an already configured (and running) nginx server.
+
+=head2 TEST_NGINX_NO_SHUFFLE
+
+Dafaults to 0. If set to 1, will make sure the tests are run in the order
+they appear in the test file (and not in random order).
+
+=head2 TEST_NGINX_USE_VALGRIND
+
+If set to 1, will start nginx with valgrind. nginx is actually started with
+C<valgrind -q --leak-check=full --gen-suppressions=all --suppressions=valgrind.suppress>,
+the suppressions option being used only if there is actually
+a valgrind.suppress file.
+
+=head2 TEST_NGINX_BINARY
+
+The command to start nginx. Defaults to C<nginx>. Can be used as an alternative
+to setting C<PATH> to run a specific nginx instance.
+
+=head2 TEST_NGINX_LOG_LEVEL
+
+Value of the last argument of the C<error_log> configuration directive.
+Defaults to C<debug>.
+
+=head2 TEST_NGINX_MASTER_PROCESS
+
+Value of the C<master_process> configuration directive. Defaults to C<off>.
+
+=head2 TEST_NGINX_SERVER_PORT
+
+Value of the port the server started by Test::Nginx will listen to. If not
+set, C<TEST_NGINX_PORT> is used. If C<TEST_NGINX_PORT> is not set,
+then C<1984> is used. See below for typical use.
+
+=head2 TEST_NGINX_CLIENT_PORT
+
+Value of the port Test::Nginx will diirect requests to. If not
+set, C<TEST_NGINX_PORT> is used. If C<TEST_NGINX_PORT> is not set,
+then C<1984> is used. A typical use of this feature is to test extreme
+network conditions by adding a "proxy" between Test::Nginx and nginx
+itself. This is described in the C<etcproxy integration> section of this
+module README.
+
+=head2 TEST_NGINX_PORT
+
+A shortcut for setting both C<TEST_NGINX_CLIENT_PORT> and
+C<TEST_NGINX_SERVER_PORT>.
+
+=head2 TEST_NGINX_SLEEP
+
+How much time (in seconds) should Test::Nginx sleep between two calls to C<syswrite> when
+sending request data. Defaults to 0.
+
+=head2 TEST_NGINX_FORCE_RESTART_ON_TEST
+
+Defaults to 1. If set to 0, Test::Nginx will not restart the nginx
+server when the config does not change between two tests.
+
+=head2 TEST_NGINX_SERVROOT
+
+The root of the nginx "hierarchy" (where you find the conf, *_tmp and logs
+directories). This value will be used with the C<-p> option of C<nginx>.
+Defaults to appending C<t/servroot> to the current directory.
+
+=head2 TEST_NGINX_IGNORE_MISSING_DIRECTIVES
+
+If set to 1 will SKIP all tests which C<config> sections resulted in a
+C<unknown directive> when trying to start C<nginx>. Useful when you want to
+run tests on a build of nginx that does not include all modules it should.
+By default, these tests will FAIL.
+
+=head2 TEST_NGINX_ERROR_LOG
+
+Error log files from all tests will be appended to the file specified with
+this variable. There is no default value which disables the feature. This
+is very useful when debugging. By default, each test triggers a start/stop
+cycle for C<nginx>. All logs are removed before each restart, so you can
+only see the logs for the last test run (which you usually do not control
+except if you set C<TEST_NGINX_NO_SHUFFLE=1>). With this, you accumulate
+all logs into a single file that is never cleaned up by Test::Nginx.
 
 =head1 Samples
 
@@ -1433,15 +1559,19 @@ This module has a Git repository on Github, which has access for all.
 
 If you want a commit bit, feel free to drop me a line.
 
-=head1 AUTHOR
+=head1 AUTHORS
 
 agentzh (章亦春) C<< <agentzh@gmail.com> >>
+
+Antoine BONAVITA C<< <antoine.bonavita@gmail.com> >>
 
 =head1 COPYRIGHT & LICENSE
 
 Copyright (c) 2009-2011, Taobao Inc., Alibaba Group (L<http://www.taobao.com>).
 
 Copyright (c) 2009-2011, agentzh C<< <agentzh@gmail.com> >>.
+
+Copyright (c) 2011, Antoine BONAVITA C<< <antoine.bonavita@gmail.com> >>.
 
 This module is licensed under the terms of the BSD license.
 
