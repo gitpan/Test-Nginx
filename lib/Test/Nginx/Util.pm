@@ -3,7 +3,7 @@ package Test::Nginx::Util;
 use strict;
 use warnings;
 
-our $VERSION = '0.15';
+our $VERSION = '0.16';
 
 use base 'Exporter';
 
@@ -279,6 +279,13 @@ sub write_user_files ($) {
 
             if (!defined $body) {
                 $body = '';
+            }
+
+            if ($fname =~ /(.*)\//) {
+                my $dir = "$HtmlDir/$1";
+                if (! -d $dir) {
+                    mkdir $dir or die "$name - Cannot create directory ", $dir;
+                }
             }
 
             open my $out, ">$HtmlDir/$fname" or

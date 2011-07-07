@@ -5,7 +5,7 @@ use lib 'inc';
 
 use Test::Base -Base;
 
-our $VERSION = '0.15';
+our $VERSION = '0.16';
 
 use Encode;
 use Data::Dumper;
@@ -66,7 +66,7 @@ our @EXPORT = qw( plan run_tests run_test
   timeout no_nginx_manager
 );
 
-sub send_request ($$$$);
+sub send_request ($$$$@);
 
 sub run_test_helper ($$);
 
@@ -131,8 +131,16 @@ sub parse_request ($$) {
         $rel_url_size = length($5);
         $after_rel_url = length($6);
         $http_ver = $8;
-        $http_ver_size = length($8);
-        $after_http_ver = length($9);
+        if (!defined $8) {
+            $http_ver_size = undef;
+        } else {
+            $http_ver_size = length($8);
+        }
+        if (!defined $9) {
+            $after_http_ver = undef;
+        } else {
+            $after_http_ver = length($9);
+        }
         $end_line_size = length($10);
     } else {
         Test::More::BAIL_OUT("$name - Request line is not valid. Should be 'meth [url [version]]'");
@@ -460,7 +468,7 @@ sub run_test_helper ($$) {
     my $req_idx = 0;
     for my $one_req (@$r_req_list) {
         my $raw_resp;
-    
+
         if ($dry_run) {
             $raw_resp = "200 OK HTTP/1.0\r\nContent-Length: 0\r\n\r\n";
         }
@@ -468,9 +476,9 @@ sub run_test_helper ($$) {
             $raw_resp = send_request( $one_req, $block->raw_request_middle_delay,
                 $timeout, $block->name );
         }
-    
+
         #warn "raw resonse: [$raw_resp]\n";
-    
+
         my ( $res, $raw_headers ) = parse_response( $name, $raw_resp );
         check_error_code($block, $res, $dry_run, $req_idx, $#$r_req_list > 0);
         check_raw_response_headers($block, $raw_headers, $dry_run, $req_idx, $#$r_req_list > 0);
@@ -681,6 +689,12 @@ sub parse_response($$) {
         my $decoded = '';
         while (1) {
             if ( $raw =~ /\G 0 [\ \t]* \r\n \r\n /gcsx ) {
+                if ( $raw =~ /\G (.+) /gcsx ) {
+                    (my $extra = $1) =~ s/([\0-\037\200-\377])/sprintf('\x{%02x}',ord $1)/eg;
+                    warn "WARNING: $name - unexpected extra bytes after last chunk in ",
+                        "response: \"$extra\"\n";
+                }
+
                 last;
             }
             if ( $raw =~ m{ \G [\ \t]* ( [A-Fa-f0-9]+ ) [\ \t]* \r\n }gcsx ) {
@@ -729,16 +743,27 @@ sub parse_response($$) {
     return ( $res, $raw_headers );
 }
 
-sub send_request ($$$$) {
-    my ( $req, $middle_delay, $timeout, $name ) = @_;
-
-    my @req_bits = ref $req ? @$req : ($req);
+sub send_request ($$$$@) {
+    my ( $req, $middle_delay, $timeout, $name, $tries ) = @_;
 
     my $sock = IO::Socket::INET->new(
         PeerAddr => $ServerAddr,
         PeerPort => $ServerPortForClient,
         Proto    => 'tcp'
-    ) or die "Can't connect to $ServerAddr:$ServerPortForClient: $!\n";
+    );
+
+    if (! defined $sock) {
+        $tries ||= 0;
+        if ($tries < 3) {
+            warn "Can't connect to $ServerAddr:$ServerPortForClient: $!\n";
+            sleep 1;
+            return send_request($req, $middle_delay, $timeout, $name, $tries + 1);
+        } else {
+            die "Can't connect to $ServerAddr:$ServerPortForClient: $!\n";
+        }
+    }
+
+    my @req_bits = ref $req ? @$req : ($req);
 
     my $flags = fcntl $sock, F_GETFL, 0
       or die "Failed to get flags: $!\n";
@@ -1199,7 +1224,7 @@ automatically added for you and the first two letters of the body ("na" in
 our example) in ONE network packet. Then, it will send the next packet (here
 it's "me=foo"). When we talk about packets here, this is nto exactly correct
 as there is no way to guarantee the behavior of the TCP/IP stack. What
-Test::Nginx can guarantee is that this will result in two calls to 
+Test::Nginx can guarantee is that this will result in two calls to
 C<syswrite>.
 
 A good way to make I<almost> sure the two calls result in two packets is to
@@ -1589,11 +1614,11 @@ Redistributions in binary form must reproduce the above copyright notice, this l
 
 =item *
 
-Neither the name of the Taobao Inc. nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission. 
+Neither the name of the Taobao Inc. nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
 
 =back
 
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE. 
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 =head1 SEE ALSO
 
