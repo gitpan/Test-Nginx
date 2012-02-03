@@ -3,17 +3,21 @@ package Test::Nginx::Util;
 use strict;
 use warnings;
 
-our $VERSION = '0.17';
+our $VERSION = '0.18';
 
 use base 'Exporter';
 
-use POSIX qw( SIGQUIT SIGKILL SIGTERM );
+use POSIX qw( SIGQUIT SIGKILL SIGTERM SIGHUP );
 use File::Spec ();
 use HTTP::Response;
 use Cwd qw( cwd );
 use List::Util qw( shuffle );
 use Time::HiRes qw( sleep );
 use ExtUtils::MakeMaker ();
+
+our $UseHup = $ENV{TEST_NGINX_USE_HUP};
+
+our $Verbose = $ENV{TEST_NGINX_VERBOSE};
 
 our $LatestNginxVersion = 0.008039;
 
@@ -26,6 +30,10 @@ our $MAX_PROCESSES = 10;
 our $NoShuffle = $ENV{TEST_NGINX_NO_SHUFFLE} || 0;
 
 our $UseValgrind = $ENV{TEST_NGINX_USE_VALGRIND};
+
+our $EventType = $ENV{TEST_NGINX_EVENT_TYPE};
+
+our $PostponeOutput = $ENV{TEST_NGINX_POSTPONE_OUTPUT};
 
 sub no_shuffle () {
     $NoShuffle = 1;
@@ -108,6 +116,10 @@ sub master_on () {
     $MasterProcessEnabled = 'on';
 }
 
+sub master_off () {
+    $MasterProcessEnabled = 'off';
+}
+
 sub master_process_enabled (@) {
     if (@_) {
         $MasterProcessEnabled = shift() ? 'on' : 'off';
@@ -117,6 +129,7 @@ sub master_process_enabled (@) {
 }
 
 our @EXPORT_OK = qw(
+    error_log_data
     setup_server_root
     write_config_file
     get_canon_version
@@ -137,6 +150,7 @@ our @EXPORT_OK = qw(
     worker_connections
     workers
     master_on
+    master_off
     config_preamble
     repeat_each
     master_process_enabled
@@ -189,6 +203,14 @@ sub server_root () {
 
 sub bail_out ($) {
     Test::More::BAIL_OUT(@_);
+}
+
+sub error_log_data () {
+    open my $in, $ErrLogFile or
+        return undef;
+    my @lines = <$in>;
+    close $in;
+    return \@lines;
 }
 
 sub run_tests () {
@@ -306,6 +328,13 @@ sub write_user_files ($) {
 sub write_config_file ($$$) {
     my ($config, $http_config, $main_config) = @_;
 
+    if ($UseHup) {
+        master_on(); # config reload is buggy when master is off
+
+    } elsif ($UseValgrind) {
+        master_off();
+    }
+
     $http_config = expand_env_in_config($http_config);
 
     if (!defined $config) {
@@ -314,6 +343,17 @@ sub write_config_file ($$$) {
 
     if (!defined $http_config) {
         $http_config = '';
+    }
+
+    if ($http_config =~ /\bpostpone_output\b/) {
+        undef $PostponeOutput;
+    }
+
+    if (defined $PostponeOutput) {
+        if ($PostponeOutput !~ /^\d+$/) {
+            die "Bad TEST_NGINX_POSTPOHNE_OUTPUT value: $PostponeOutput\n";
+        }
+        $http_config .= "\n    postpone_output $PostponeOutput;\n";
     }
 
     if (!defined $main_config) {
@@ -328,6 +368,10 @@ daemon $DaemonEnabled;
 master_process $MasterProcessEnabled;
 error_log $ErrLogFile $LogLevel;
 pid       $PidFile;
+env MOCKEAGAIN_VERBOSE;
+env MOCKEAGAIN_WRITE_TIMEOUT_PATTERN;
+env LD_PRELOAD;
+env DYLD_INSERT_LIBRARIES;
 
 $main_config
 
@@ -371,9 +415,16 @@ _EOC_
 
 events {
     worker_connections  $WorkerConnections;
-}
-
 _EOC_
+
+    if ($EventType) {
+        print $out <<_EOC_;
+    use $EventType;
+_EOC_
+    }
+
+    print $out "}\n";
+
     close $out;
 }
 
@@ -500,12 +551,14 @@ sub run_test ($) {
         # setting these values to something meaningful but should not be used
         $should_restart = 0;
         $should_reconfig = 0;
+
     } elsif ($NoNginxManager) {
         # One config but not manager: it's worth a warning.
         Test::Base::diag("NO_NGINX_MANAGER activated: config for $name ignored");
         # Like above: setting them to something meaningful just in case.
         $should_restart = 0;
         $should_reconfig = 0;
+
     } else {
         # One config and manager. Restart only if forced to or if config
         # changed.
@@ -694,10 +747,19 @@ start_nginx:
             }
 
             if ($UseValgrind) {
-                if (-f 'valgrind.suppress') {
-                    $cmd = "valgrind -q --leak-check=full --gen-suppressions=all --suppressions=valgrind.suppress $cmd";
+                my $opts;
+
+                if ($UseValgrind =~ /^\d+$/) {
+                    $opts = "--tool=memcheck --leak-check=full";
+
                 } else {
-                    $cmd = "valgrind -q --leak-check=full --gen-suppressions=all $cmd";
+                    $opts = $UseValgrind;
+                }
+
+                if (-f 'valgrind.suppress') {
+                    $cmd = "valgrind -q $opts --gen-suppressions=all --suppressions=valgrind.suppress $cmd";
+                } else {
+                    $cmd = "valgrind -q $opts --gen-suppressions=all $cmd";
                 }
 
                 warn "$name\n";
@@ -755,6 +817,26 @@ start_nginx:
 
     my $i = 0;
     while ($i++ < $RepeatEach) {
+        #warn "Use hup: $UseHup, i: $i\n";
+
+        if ($UseHup && $i > 1) {
+            my $pid = get_pid_from_pidfile($name);
+            if (system("ps $pid > /dev/null") == 0) {
+                if ($Verbose) {
+                    warn "sending HUP signal to $pid\n";
+                }
+
+                if (kill(SIGHUP, $pid) == 0) { # send quit signal
+                    warn("$name - Failed to send HUP signal to the nginx process with PID $pid");
+                }
+                if ($TestNginxSleep) {
+                    sleep $TestNginxSleep;
+                } else {
+                    sleep 0.1;
+                }
+            }
+        }
+
         if ($should_skip) {
             SKIP: {
                 Test::More::skip("$name - $skip_reason", $tests_to_skip);
@@ -773,7 +855,7 @@ start_nginx:
     }
 
     if (my $total_errlog = $ENV{TEST_NGINX_ERROR_LOG}) {
-        my $errlog = "$LogDir/error.log";
+        my $errlog = $ErrLogFile;
         if (-s $errlog) {
             open my $out, ">>$total_errlog" or
                 die "Failed to append test case title to $total_errlog: $!\n";
@@ -789,23 +871,45 @@ start_nginx:
         if (-f $PidFile) {
             #warn "found pid file...";
             my $pid = get_pid_from_pidfile($name);
+            my $i = 0;
+retry:
             if (system("ps $pid > /dev/null") == 0) {
                 write_config_file($config, $block->http_config, $block->main_config);
+
+                if ($Verbose) {
+                    warn "sending QUIT signal to $pid\n";
+                }
+
                 if (kill(SIGQUIT, $pid) == 0) { # send quit signal
                     warn("$name - Failed to send quit signal to the nginx process with PID $pid");
                 }
+
                 if ($TestNginxSleep) {
                     sleep $TestNginxSleep;
                 } else {
                     sleep 0.1;
                 }
+
                 if (-f $PidFile) {
-                    #warn "killing with force (valgrind or profile)...\n";
+                    if ($i++ < 5) {
+                        if ($Verbose) {
+                            warn "nginx not quitted, retrying...\n";
+                        }
+
+                        goto retry;
+                    }
+
+                    if ($Verbose) {
+                        warn "sending KILL signal to $pid\n";
+                    }
+
                     kill(SIGKILL, $pid);
                     sleep 0.02;
+
                 } else {
                     #warn "nginx killed";
                 }
+
             } else {
                 unlink $PidFile or
                     die "Failed to remove pid file $PidFile\n";

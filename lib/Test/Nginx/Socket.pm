@@ -5,7 +5,7 @@ use lib 'inc';
 
 use Test::Base -Base;
 
-our $VERSION = '0.17';
+our $VERSION = '0.18';
 
 use Encode;
 use Data::Dumper;
@@ -33,12 +33,14 @@ use Test::Nginx::Util qw(
   $ConfFile
   $RunTestHelper
   $RepeatEach
+  error_log_data
   worker_connections
   master_process_enabled
   config_preamble
   repeat_each
   workers
   master_on
+  master_off
   log_level
   no_shuffle
   no_root_location
@@ -60,7 +62,7 @@ our $NoLongString = undef;
 our @EXPORT = qw( plan run_tests run_test
   repeat_each config_preamble worker_connections
   master_process_enabled
-  no_long_string workers master_on
+  no_long_string workers master_on master_off
   log_level no_shuffle no_root_location
   server_addr server_root html_dir server_port
   timeout no_nginx_manager
@@ -73,6 +75,8 @@ sub run_test_helper ($$);
 sub error_event_handler ($);
 sub read_event_handler ($);
 sub write_event_handler ($);
+sub check_response_body ($$$$$);
+sub fmt_str ($);
 
 sub no_long_string () {
     $NoLongString = 1;
@@ -495,7 +499,11 @@ again:
             $raw_resp = '';
         }
 
-        my ( $res, $raw_headers, $left ) = parse_response( $name, $raw_resp );
+        my ( $res, $raw_headers, $left );
+
+        if (!defined $block->ignore_response) {
+            ( $res, $raw_headers, $left ) = parse_response( $name, $raw_resp );
+        }
 
         if (!$n) {
             if ($left) {
@@ -510,10 +518,15 @@ again:
             $n--;
         }
 
-        check_error_code($block, $res, $dry_run, $req_idx, $need_array);
-        check_raw_response_headers($block, $raw_headers, $dry_run, $req_idx, $need_array);
-        check_response_headers($block, $res, $raw_headers, $dry_run, $req_idx, $need_array);
-        check_response_body($block, $res, $dry_run, $req_idx, $need_array);
+        if (!defined $block->ignore_response) {
+            check_error_code($block, $res, $dry_run, $req_idx, $need_array);
+            check_raw_response_headers($block, $raw_headers, $dry_run, $req_idx, $need_array);
+            check_response_headers($block, $res, $raw_headers, $dry_run, $req_idx, $need_array);
+            check_response_body($block, $res, $dry_run, $req_idx, $need_array);
+        }
+
+        check_error_log($block, $res, $dry_run, $req_idx, $need_array);
+
         $req_idx++;
 
         if ($n) {
@@ -622,7 +635,98 @@ sub check_response_headers($$$$$) {
     }
 }
 
-sub check_response_body() {
+sub check_error_log ($$$$$) {
+    my ($block, $res, $dry_run, $req_idx, $need_array) = @_;
+    my $name = $block->name;
+    my $lines;
+
+    if (defined $block->error_log) {
+        my $pats = $block->error_log;
+        if (!ref $pats) {
+            chomp $pats;
+            $pats = [$pats];
+
+        } else {
+            my @clone = @$pats;
+            $pats = \@clone;
+        }
+
+        $lines = error_log_data();
+        for my $line (@$lines) {
+            for my $pat (@$pats) {
+                next if !defined $pat;
+                if (ref $pat && $line =~ /$pat/ || $line =~ /\Q$pat\E/) {
+                    SKIP: {
+                        skip "$name - tests skipped due to the lack of directive $dry_run", 1 if $dry_run;
+                        pass("$name - pattern \"$pat\" matches a line in error.log");
+                    }
+                    undef $pat;
+                }
+            }
+        }
+
+        for my $pat (@$pats) {
+            if (defined $pat) {
+                SKIP: {
+                    skip "$name - tests skipped due to the lack of directive $dry_run", 1 if $dry_run;
+                    fail("$name - pattern \"$pat\" matches a line in error.log");
+                }
+            }
+        }
+    }
+
+    if (defined $block->no_error_log) {
+        #warn "HERE";
+        my $pats = $block->no_error_log;
+        if (!ref $pats) {
+            chomp $pats;
+            $pats = [$pats];
+
+        } else {
+            my @clone = @$pats;
+            $pats = \@clone;
+        }
+
+        $lines ||= error_log_data();
+        for my $line (@$lines) {
+            for my $pat (@$pats) {
+                next if !defined $pat;
+                #warn "test $pat\n";
+                if ((ref $pat && $line =~ /$pat/) || $line =~ /\Q$pat\E/) {
+                    SKIP: {
+                        skip "$name - tests skipped due to the lack of directive $dry_run", 1 if $dry_run;
+                        my $ln = fmt_str($line);
+                        my $p = fmt_str($pat);
+                        fail("$name - pattern \"$p\" should not match any line in error.log but matches line \"$ln\"");
+                    }
+                    undef $pat;
+                }
+            }
+        }
+
+        for my $pat (@$pats) {
+            if (defined $pat) {
+                SKIP: {
+                    skip "$name - tests skipped due to the lack of directive $dry_run", 1 if $dry_run;
+                    my $p = fmt_str($pat);
+                    pass("$name - pattern \"$p\" does not match a line in error.log");
+                }
+            }
+        }
+    }
+
+}
+
+sub fmt_str ($) {
+    my $str = shift;
+    chomp $str;
+    $str =~ s/"/\\"/g;
+    $str =~ s/\r/\\r/g;
+    $str =~ s/\n/\\n/g;
+    $str;
+}
+
+sub check_response_body ($$$$$) {
     my ($block, $res, $dry_run, $req_idx, $need_array) = @_;
     my $name = $block->name;
     if (   defined $block->response_body
@@ -812,7 +916,7 @@ sub send_request ($$$$@) {
 
     if (! defined $sock) {
         $tries ||= 0;
-        if ($tries < 3) {
+        if ($tries < 10) {
             warn "Can't connect to $ServerAddr:$ServerPortForClient: $!\n";
             sleep 1;
             return send_request($req, $middle_delay, $timeout, $name, $tries + 1);
@@ -1471,6 +1575,59 @@ If the test is made of multiple requests, then
 error_code B<MUST> be an array with the expected value for the response status
 of each request in the test.
 
+=head2 error_log
+
+Checks if the pattern or multiple patterns all appear in lines of the F<error.log> file.
+
+For example,
+
+    === TEST 1: matched with j
+    --- config
+        location /re {
+            content_by_lua '
+                m = ngx.re.match("hello, 1234", "([0-9]+)", "j")
+                if m then
+                    ngx.say(m[0])
+                else
+                    ngx.say("not matched!")
+                end
+            ';
+        }
+    --- request
+        GET /re
+    --- response_body
+    1234
+    --- error_log: pcre JIT compiling result: 1
+
+Then the substring "pcre JIT compiling result: 1" must appear literally in a line of F<error.log>.
+
+Multiple patterns are also supported, for example:
+
+    --- error_log eval
+    ["abc", qr/blah/]
+
+then the substring "abc" must appear literally in a line of F<error.log>, and the regex C<qr/blah>
+must also match a line in F<error.log>.
+
+=head2 no_error_log
+
+Very much like the C<--- error_log> section, but does the opposite test, i.e.,
+pass only when the specified patterns of lines do not appear in the F<error.log> file at all.
+
+Here is an example:
+
+    --- no_error_log
+    [error]
+
+This test will fail when any of the line in the F<error.log> file contains the string C<"[error]">.
+
+Just like the C<--- error_log> section, one can also specify multiple patterns:
+
+    --- no_error_log eval
+    ["abc", qr/blah/]
+
+Then if any line in F<error.log> contains the string C<"abc"> or match the Perl regex C<qr/blah/>, then the test will fail.
+
 =head2 raw_request
 
 The exact request to send to nginx. This is useful when you want to test
@@ -1489,6 +1646,10 @@ This can also be useful to tests "invalid" request lines:
 
     --- raw_request
     GET /foo HTTP/2.0 THE_FUTURE_IS_NOW
+
+=head2 ignore_response
+
+Do not attempt to parse the response or run the response related subtests.
 
 =head2 user_files
 
@@ -1519,6 +1680,29 @@ All environment variables starting with C<TEST_NGINX_> are expanded in the
 sections used to build the configuration of the server that tests automatically
 starts. The following environment variables are supported by this module:
 
+=head2 TEST_NGINX_VERBOSE
+
+Controls whether to output verbose debugging messages in Test::Nginx. Default to empty.
+
+=head2 TEST_NGINX_USE_HUP
+
+When set to 1, Test::Nginx will try to send HUP signal to the
+nginx master process to reload the config file between
+successive C<repeast_each> tests. When this envirnoment is set
+to 1, it will also enfornce the "master_process on" config line
+in the F<nginx.conf> file,
+because Nginx is buggy in processing HUP signal when the master process is off.
+
+=head2 TEST_NGINX_POSTPONE_OUTPUT
+
+Defaults to empty. This environment takes positive integer numbers as its value and it will cause the auto-generated nginx.conf file to have a "postpone_output" setting in the http {} block.
+
+For example, setting TEST_NGINX_POSTPONE_OUTPUT to 1 will have the following line in nginx.conf's http {} block:
+
+    postpone_output 1;
+
+and it will effectively disable the write buffering in nginx's ngx_http_write_module.
+
 =head2 TEST_NGINX_NO_NGINX_MANAGER
 
 Defaults to 0. If set to 1, Test::Nginx module will not manage
@@ -1532,10 +1716,16 @@ they appear in the test file (and not in random order).
 
 =head2 TEST_NGINX_USE_VALGRIND
 
-If set to 1, will start nginx with valgrind. nginx is actually started with
-C<valgrind -q --leak-check=full --gen-suppressions=all --suppressions=valgrind.suppress>,
+If set, Test::Nginx will start nginx with valgrind with the the value of this environment as the options.
+
+Nginx is actually started with
+C<valgrind -q $TEST_NGINX_USE_VALGRIND --gen-suppressions=all --suppressions=valgrind.suppress>,
 the suppressions option being used only if there is actually
 a valgrind.suppress file.
+
+If this environment is set to the number C<1> or any other
+non-zero numbers, then it is equivalent to taking the value
+C<--tool=memcheck --leak-check=full>.
 
 =head2 TEST_NGINX_BINARY
 
@@ -1593,6 +1783,14 @@ If set to 1 will SKIP all tests which C<config> sections resulted in a
 C<unknown directive> when trying to start C<nginx>. Useful when you want to
 run tests on a build of nginx that does not include all modules it should.
 By default, these tests will FAIL.
+
+=head2 TEST_NGINX_EVENT_TYPE
+
+This environment can be used to specify a event API type to be used by Nginx. Possible values are C<epoll>, C<kqueue>, C<select>, C<rtsig>, C<poll>, and others.
+
+For example,
+
+    $ TEST_NGINX_EVENT_TYPE=select prove -r t
 
 =head2 TEST_NGINX_ERROR_LOG
 
@@ -1688,11 +1886,9 @@ Antoine BONAVITA C<< <antoine.bonavita@gmail.com> >>
 
 =head1 COPYRIGHT & LICENSE
 
-Copyright (c) 2009-2011, Taobao Inc., Alibaba Group (L<http://www.taobao.com>).
+Copyright (c) 2009-2012, agentzh C<< <agentzh@gmail.com> >>.
 
-Copyright (c) 2009-2011, agentzh C<< <agentzh@gmail.com> >>.
-
-Copyright (c) 2011, Antoine BONAVITA C<< <antoine.bonavita@gmail.com> >>.
+Copyright (c) 2011-2012, Antoine BONAVITA C<< <antoine.bonavita@gmail.com> >>.
 
 This module is licensed under the terms of the BSD license.
 
@@ -1710,7 +1906,7 @@ Redistributions in binary form must reproduce the above copyright notice, this l
 
 =item *
 
-Neither the name of the Taobao Inc. nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
+Neither the name of the authors nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
 
 =back
 
