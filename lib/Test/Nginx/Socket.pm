@@ -5,14 +5,17 @@ use lib 'inc';
 
 use Test::Base -Base;
 
-our $VERSION = '0.19';
+our $VERSION = '0.20';
 
+use POSIX qw( SIGQUIT SIGKILL SIGTERM SIGHUP );
 use Encode;
-use Data::Dumper;
+#use Data::Dumper;
 use Time::HiRes qw(sleep time);
 use Test::LongString;
 use List::MoreUtils qw( any );
+use List::Util qw( sum );
 use IO::Select ();
+use File::Temp qw( tempfile );
 
 our $ServerAddr = 'localhost';
 
@@ -24,6 +27,7 @@ use Test::Nginx::Util qw(
   bail_out
   trim
   show_all_chars
+  get_pid_from_pidfile
   parse_headers
   run_tests
   $ServerPortForClient
@@ -33,6 +37,7 @@ use Test::Nginx::Util qw(
   $ConfFile
   $RunTestHelper
   $RepeatEach
+  $CheckLeak
   timeout
   error_log_data
   worker_connections
@@ -78,6 +83,8 @@ sub read_event_handler ($);
 sub write_event_handler ($);
 sub check_response_body ($$$$$);
 sub fmt_str ($);
+sub gen_cmd_from_req ($);
+sub get_linear_regression_slope ($);
 
 sub no_long_string () {
     $NoLongString = 1;
@@ -452,6 +459,67 @@ sub run_test_helper ($$) {
         bail_out("$name - request empty");
     }
 
+    if ($CheckLeak) {
+        $dry_run = 1;
+
+        warn "$name\n";
+
+        my $req = $r_req_list->[0];
+        my $cmd = gen_cmd_from_req($req);
+
+        # start a sub-process to run ab or weighttp
+        my $pid = $Test::Nginx::Util::ForkManager->start;
+        if (!$pid) {
+            # child process
+            exec @$cmd;
+
+        } else {
+            # main process
+            my $ngx_pid = get_pid_from_pidfile($name);
+            sleep 1;
+            my @rss_list;
+            for (my $i = 0; $i < 100; $i++) {
+                sleep 0.02;
+                my $out = `ps -eo pid,rss|grep $ngx_pid`;
+                my @lines = grep { $_->[0] eq $ngx_pid }
+                                 map { s/^\s+|\s+$//g; [ split /\s+/, $_ ] }
+                                 split /\n/, $out;
+
+                if (@lines == 0) {
+                    last;
+                }
+
+                if (@lines > 1) {
+                    warn "Bad ps output: \"$out\"\n";
+                    next;
+                }
+
+                my $ln = shift @lines;
+                push @rss_list, $ln->[1];
+            }
+
+            #if ($Test::Nginx::Util::Verbose) {
+            warn "LeakTest: [@rss_list]\n";
+            #}
+
+            if (@rss_list == 0) {
+                warn "LeakTest: k=N/A\n";
+
+            } else {
+                my $k = get_linear_regression_slope(\@rss_list);
+                warn "LeakTest: k=$k\n";
+                #$k = get_linear_regression_slope([1 .. 100]);
+                #warn "K = $k (1 expected)\n";
+                #$k = get_linear_regression_slope([map { $_ * 2 } 1 .. 100]);
+                #warn "K = $k (2 expected)\n";
+            }
+
+            if (system("ps $pid > /dev/null") == 0) {
+                kill(SIGKILL, $pid);
+            }
+        }
+    }
+
     #warn "request: $req\n";
 
     my $timeout = $block->timeout;
@@ -461,13 +529,13 @@ sub run_test_helper ($$) {
 
     my $req_idx = 0;
     for my $one_req (@$r_req_list) {
-        my $raw_resp;
+        my ($raw_resp, $head_req);
 
         if ($dry_run) {
             $raw_resp = "200 OK HTTP/1.0\r\nContent-Length: 0\r\n\r\n";
-        }
-        else {
-            $raw_resp = send_request( $one_req, $block->raw_request_middle_delay,
+
+        } else {
+            ($raw_resp, $head_req) = send_request( $one_req, $block->raw_request_middle_delay,
                 $timeout, $block->name );
         }
 
@@ -492,7 +560,7 @@ again:
         my ( $res, $raw_headers, $left );
 
         if (!defined $block->ignore_response) {
-            ( $res, $raw_headers, $left ) = parse_response( $name, $raw_resp );
+            ( $res, $raw_headers, $left ) = parse_response( $name, $raw_resp, $head_req );
         }
 
         if (!$n) {
@@ -570,6 +638,7 @@ sub check_error_code($$$$$) {
         }
     }
 }
+
 sub check_raw_response_headers($$$$$) {
     my ($block, $raw_headers, $dry_run, $req_idx, $need_array) = @_;
     my $name = $block->name;
@@ -584,6 +653,7 @@ sub check_raw_response_headers($$$$$) {
         }
     }
 }
+
 sub check_response_headers($$$$$) {
     my ($block, $res, $raw_headers, $dry_run, $req_idx, $need_array) = @_;
     my $name = $block->name;
@@ -645,6 +715,9 @@ sub check_error_log ($$$$$) {
             my @lines = split /\n+/, $pats;
             $pats = \@lines;
 
+        } elsif (ref $pats eq 'Regexp') {
+            $pats = [$pats];
+
         } else {
             my @clone = @$pats;
             $pats = \@clone;
@@ -669,6 +742,7 @@ sub check_error_log ($$$$$) {
                 SKIP: {
                     skip "$name - tests skipped due to the lack of directive $dry_run", 1 if $dry_run;
                     fail("$name - pattern \"$pat\" matches a line in error.log");
+                    #die join("", @$lines);
                 }
             }
         }
@@ -812,8 +886,8 @@ sub check_response_body ($$$$$) {
     }
 }
 
-sub parse_response($$) {
-    my ( $name, $raw_resp ) = @_;
+sub parse_response($$$) {
+    my ( $name, $raw_resp, $head_req ) = @_;
 
     my $left;
 
@@ -894,8 +968,10 @@ sub parse_response($$) {
     } elsif (defined $len && $len ne '' && $len >= 0) {
         my $raw = $res->content;
         if (length $raw < $len) {
-            warn "WARNING: $name - response body truncated: ",
-                "$len expected, but got ", length $raw, "\n";
+            if (!$head_req) {
+                warn "WARNING: $name - response body truncated: ",
+                    "$len expected, but got ", length $raw, "\n";
+            }
 
         } elsif (length $raw > $len) {
             my $content = substr $raw, 0, $len;
@@ -939,6 +1015,16 @@ sub send_request ($$$$@) {
     #warn "connected";
 
     my @req_bits = ref $req ? @$req : ($req);
+
+    my $head_req = 0;
+    {
+        my $req = join '', map { $_->{value} } @req_bits;
+        #warn "Request: $req\n";
+        if ($req =~ /^\s*HEAD\s+/) {
+            #warn "Found HEAD request!\n";
+            $head_req = 1;
+        }
+    }
 
     #my $flags = fcntl $sock, F_GETFL, 0
     #or die "Failed to get flags: $!\n";
@@ -1081,12 +1167,12 @@ sub send_request ($$$$@) {
         }
     }
 
-    return $ctx->{resp};
+    return ($ctx->{resp}, $head_req);
 }
 
 sub timeout_event_handler ($) {
     my $ctx = shift;
-    warn "ERROR: socket client: timed out - $ctx->{name}\n";
+    fail("ERROR: client socket timed out - $ctx->{name}\n");
 }
 
 sub error_event_handler ($) {
@@ -1189,6 +1275,122 @@ sub read_event_handler ($) {
 
     # impossible to reach here...
     return undef;
+}
+
+sub gen_cmd_from_req ($) {
+    my $req = shift;
+
+    $req = join '', map { $_->{value} } @$req;
+
+    #warn "Req: $req\n";
+
+    my ($meth, $uri, $http_ver);
+    if ($req =~ m{^\s*(\w+)\s+(.*\S)\s*HTTP/(\S+)\r\n}gcs) {
+        ($meth, $uri, $http_ver) = ($1, $2, $3);
+
+    } else {
+        bail_out "cannot parse the status line in the request: $req";
+    }
+
+    #warn "HTTP version: $http_ver\n";
+
+    my @opts = ('-c2', '-k', '-n100000');
+
+    my $prog;
+    if ($http_ver eq '1.1' and $meth eq 'GET') {
+        $prog = 'weighttp';
+
+    } else {
+        # HTTP 1.0
+        $prog = 'ab';
+        unshift @opts, '-r', '-d', '-S';
+    }
+
+    my @headers;
+    if ($req =~ m{\G(.*?)\r\n\r\n}gcs) {
+        my $headers = $1;
+        #warn "raw headers: $headers\n";
+        @headers = grep {
+            !/^Connection\s*:/i && !/^Host: localhost$/i
+                && !/^Content-Length\s*:/i
+        } split /\r\n/, $headers;
+
+    } else {
+        bail_out "cannot parse the header entries in the request: $req";
+    }
+
+    #warn "headers: @headers ", scalar(@headers), "\n";
+
+    for my $h (@headers) {
+        #warn "h: $h\n";
+        if ($prog eq 'ab' && $h =~ /^\s*Content-Type\s*:\s*(.*\S)/i) {
+            my $type = $1;
+            push @opts, '-T', $type;
+
+        } else {
+            push @opts, '-H', $h;
+        }
+    }
+
+    my $bodyfile;
+
+    if ($req =~ m{\G.+}gcs || $meth eq 'POST' || $meth eq 'PUT') {
+        my $body = $&;
+
+        if (!defined $body) {
+            $body = '';
+        }
+
+        my ($out, $bodyfile) = tempfile("bodyXXXXXXX", UNLINK => 1,
+                                        SUFFIX => '.temp', TMPDIR => 1);
+        print $out $body;
+        close $out;
+
+        if ($meth eq 'PUT') {
+            push @opts, '-u', $bodyfile;
+
+        } elsif ($meth eq 'POST') {
+            push @opts, '-p', $bodyfile;
+
+        } else {
+            warn "WARNING: method $meth not supported for ab when taking a request body\n";
+            $meth = 'PUT';
+            push @opts, '-p', $bodyfile;
+        }
+    }
+
+    if ($meth eq 'HEAD') {
+        unshift @opts, '-i';
+    }
+
+    my $link;
+    {
+        my $server = $ServerAddr;
+        my $port = $ServerPortForClient;
+        $link = "http://$server:$port$uri";
+    }
+
+    my @cmd = ($prog, @opts, $link);
+
+    if ($Test::Nginx::Util::Verbose) {
+        warn "command: @cmd\n";
+    }
+
+    return \@cmd;
+}
+
+sub get_linear_regression_slope ($) {
+    my $list = shift;
+
+    my $n = @$list;
+    my $avg_x = ($n + 1) / 2;
+    my $avg_y = sum(@$list) / $n;
+
+    my $x = 0;
+    my $avg_xy = sum(map { $x++; $x * $_ } @$list) / $n;
+    my $avg_x2 = sum(map { $_ * $_ } 1 .. $n) / $n;
+    my $k = ($avg_xy - $avg_x * $avg_y) / ($avg_x2 - $avg_x * $avg_x);
+    return sprintf("%.01f", $k);
 }
 
 1;
@@ -1600,6 +1802,32 @@ If the test is made of multiple requests, then
 error_code_like B<MUST> be an array with the expected value for the response status
 of each request in the test.
 
+=head2 timeout
+
+Specify the timeout value (in seconds) for the HTTP client embeded into the test scaffold. This has nothing
+to do with the server side configuration.
+
+Note that, just as almost all the timeout settings in the nginx world, this timeout
+also specifies the maximum waiting time between two successive I/O events on the same socket handle,
+rather than the total waiting time for the current socket operation.
+
+When the timeout setting expires, a test failure will be
+triggered with the message "ERROR: client socket timed out - TEST NAME".
+
+Here is an example:
+
+    === TEST 1: test timeout
+    --- location
+        location = /t {
+            echo_sleep 1;
+            echo ok;
+        }
+    --- request
+        GET /t
+    --- response_body
+    ok
+    --- timeout: 1.5
+
 =head2 error_log
 
 Checks if the pattern or multiple patterns all appear in lines of the F<error.log> file.
@@ -1709,11 +1937,69 @@ starts. The following environment variables are supported by this module:
 
 Controls whether to output verbose debugging messages in Test::Nginx. Default to empty.
 
+=head2 TEST_NGINX_CHECK_LEAK
+
+When set to 1, the test scaffold performs the most general memory
+leak test by means of calling C<weighttpd>/C<ab> and C<ps>.
+
+Specifically, it starts C<weighttp> (for HTTP 1.1 C<GET> requests) or
+C<ab> (for HTTP 1.0 requests) to repeatedly hitting Nginx for
+seconds in a sub-process, and then after about 1 second, it will
+start sampling the RSS value of the Nginx process by calling
+the C<ps> utility every 20 ms. Finally, it will output all
+the sample point data and the
+line slope of the linear regression result on the 100 sample points.
+
+One typical output for non-leaking test cases:
+
+    t/075-logby.t .. 3/17 TEST 2: log_by_lua_file
+    LeakTest: [2176 2176 2176 2176 2176 2176 2176
+     2176 2176 2176 2176 2176 2176 2176 2176 2176
+     2176 2176 2176 2176 2176 2176 2176 2176 2176
+     2176 2176 2176 2176 2176 2176 2176 2176 2176
+     2176 2176 2176 2176 2176 2176 2176 2176 2176
+     2176 2176 2176 2176 2176 2176 2176 2176 2176
+     2176 2176 2176 2176 2176 2176 2176 2176 2176
+     2176 2176 2176 2176 2176 2176 2176 2176 2176
+     2176 2176 2176 2176 2176 2176 2176 2176 2176
+     2176 2176 2176 2176 2176 2176 2176 2176 2176
+     2176 2176 2176 2176 2176 2176 2176 2176 2176
+     2176 2176 2176]
+    LeakTest: k=0.0
+
+and here is an example of leaking:
+
+    TEST 5: ngx.ctx available in log_by_lua (not defined yet)
+    LeakTest: [4396 4440 4476 4564 4620 4708 4752
+     4788 4884 4944 4996 5032 5080 5132 5188 5236
+     5348 5404 5464 5524 5596 5652 5700 5776 5828
+     5912 5964 6040 6108 6108 6316 6316 6584 6672
+     6672 6752 6820 6912 6912 6980 7064 7152 7152
+     7240 7340 7340 7432 7508 7508 7600 7700 7700
+     7792 7896 7896 7992 7992 8100 8100 8204 8296
+     8296 8416 8416 8512 8512 8624 8624 8744 8744
+     8848 8848 8968 8968 9084 9084 9204 9204 9324
+     9324 9444 9444 9584 9584 9704 9704 9832 9832
+     9864 9964 9964 10096 10096 10488 10488 10488
+     10488 10488 11052 11052]
+    LeakTest: k=64.1
+
+Even very small leaks can be amplified and caught easily by this
+testing mode because their slopes will usually be far above C<1.0>.
+
+For now, only C<GET>, C<POST>, C<PUT>, and C<HEAD> requests are supported
+(due to the limited HTTP support in both C<ab> and C<weighttp>).
+Other methods specified in the test cases will turn to C<GET> with force.
+
+The tests in this mode will always succeed because this mode also
+enforces the "dry-run" mode.
+
 =head2 TEST_NGINX_USE_HUP
 
-When set to 1, Test::Nginx will try to send HUP signal to the
-nginx master process to reload the config file between
-successive C<repeast_each> tests. When this envirnoment is set
+When set to 1, the test scaffold will try to send C<HUP> signal to the
+Nginx master process to reload the config file between
+successive test blocks (but not successive C<repeast_each>
+sub-tests within the same test block). When this envirnoment is set
 to 1, it will also enfornce the "master_process on" config line
 in the F<nginx.conf> file,
 because Nginx is buggy in processing HUP signal when the master process is off.
@@ -1902,6 +2188,11 @@ This module has a Git repository on Github, which has access for all.
     http://github.com/agentzh/test-nginx
 
 If you want a commit bit, feel free to drop me a line.
+
+=head1 DEBIAN PACKAGES
+
+António P. P. Almeida is maintaining a Debian package for this module
+in his Debian repository: http://debian.perusio.net
 
 =head1 AUTHORS
 

@@ -3,7 +3,7 @@ package Test::Nginx;
 use strict;
 use warnings;
 
-our $VERSION = '0.19';
+our $VERSION = '0.20';
 
 __END__
 
@@ -280,6 +280,11 @@ This module has a Git repository on Github, which has access for all.
     http://github.com/agentzh/test-nginx
 
 If you want a commit bit, feel free to drop me a line.
+
+=head1 DEBIAN PACKAGES
+
+António P. P. Almeida is maintaining a Debian package for this module
+in his Debian repository: http://debian.perusio.net
 
 =head1 AUTHORS
 
