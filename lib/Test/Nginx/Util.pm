@@ -3,7 +3,7 @@ package Test::Nginx::Util;
 use strict;
 use warnings;
 
-our $VERSION = '0.20';
+our $VERSION = '0.21';
 
 use base 'Exporter';
 
@@ -16,6 +16,13 @@ use Time::HiRes qw( sleep );
 use ExtUtils::MakeMaker ();
 use File::Path qw(make_path);
 use File::Find qw(find);
+use File::Temp qw( tempfile );
+use IO::Socket::INET;
+use Test::LongString;
+
+our $ConfigVersion;
+
+our $NoLongString = undef;
 
 our $UseHup = $ENV{TEST_NGINX_USE_HUP};
 
@@ -26,12 +33,17 @@ our $LatestNginxVersion = 0.008039;
 our $NoNginxManager = $ENV{TEST_NGINX_NO_NGINX_MANAGER} || 0;
 our $Profiling = 0;
 
+our $InSubprocess;
 our $RepeatEach = 1;
 our $MAX_PROCESSES = 10;
 
 our $NoShuffle = $ENV{TEST_NGINX_NO_SHUFFLE} || 0;
 
 our $UseValgrind = $ENV{TEST_NGINX_USE_VALGRIND};
+
+our $UseStap = $ENV{TEST_NGINX_USE_STAP};
+
+our $StapOutFile = $ENV{TEST_NGINX_STAP_OUT};
 
 our $EventType = $ENV{TEST_NGINX_EVENT_TYPE};
 
@@ -40,6 +52,56 @@ our $PostponeOutput = $ENV{TEST_NGINX_POSTPONE_OUTPUT};
 our $Timeout = $ENV{TEST_NGINX_TIMEOUT} || 3;
 
 our $CheckLeak = $ENV{TEST_NGINX_CHECK_LEAK} || 0;
+
+our $ServerAddr = 'localhost';
+
+our $StapOutFileHandle;
+
+our @RandStrAlphabet = ('A' .. 'Z', 'a' .. 'z', '0' .. '9',
+    '#', '@', '-', '_', '^');
+
+#$SIG{CHLD} = 'IGNORE';
+
+sub is_running ($) {
+    my $pid = shift;
+    return kill 0, $pid;
+}
+
+sub gen_rand_str {
+    my $len = shift;
+
+    my $s = '';
+    for (my $i = 0; $i < $len; $i++) {
+        my $j = int rand scalar @RandStrAlphabet;
+        my $c = $RandStrAlphabet[$j];
+        $s .= $c;
+    }
+
+    return $s;
+}
+
+sub no_long_string () {
+    $NoLongString = 1;
+}
+
+sub server_addr (@) {
+    if (@_) {
+
+        #warn "setting server addr to $_[0]\n";
+        $ServerAddr = shift;
+    }
+    else {
+        return $ServerAddr;
+    }
+}
+
+sub stap_out_fh {
+    return $StapOutFileHandle;
+}
+
+sub stap_out_fname {
+    return $StapOutFile;
+}
 
 sub timeout (@) {
     if (@_) {
@@ -58,17 +120,7 @@ sub no_nginx_manager () {
     $NoNginxManager = 1;
 }
 
-our $ForkManager;
-
 sub bail_out (@);
-
-if ($Profiling || $UseValgrind || $CheckLeak) {
-    eval "use Parallel::ForkManager";
-    if ($@) {
-        bail_out "Failed to load Parallel::ForkManager: $@\n";
-    }
-    $ForkManager = new Parallel::ForkManager($MAX_PROCESSES);
-}
 
 our $NginxBinary            = $ENV{TEST_NGINX_BINARY} || 'nginx';
 our $Workers                = 1;
@@ -85,6 +137,16 @@ our $ForceRestartOnTest     = (defined $ENV{TEST_NGINX_FORCE_RESTART_ON_TEST})
                                ? $ENV{TEST_NGINX_FORCE_RESTART_ON_TEST} : 1;
 
 our $ChildPid;
+our $UdpServerPid;
+our $TcpServerPid;
+
+sub sleep_time {
+    return $TestNginxSleep;
+}
+
+sub verbose {
+    return $Verbose;
+}
 
 sub server_port (@) {
     if (@_) {
@@ -158,6 +220,17 @@ sub master_process_enabled (@) {
 }
 
 our @EXPORT_OK = qw(
+    is_running
+    $NoLongString
+    no_long_string
+    $ServerAddr
+    server_addr
+    parse_time
+    $UseStap
+    verbose
+    sleep_time
+    stap_out_fh
+    stap_out_fname
     bail_out
     error_log_data
     setup_server_root
@@ -197,7 +270,7 @@ our @EXPORT_OK = qw(
 );
 
 
-if ($Profiling || $UseValgrind) {
+if ($Profiling || $UseValgrind || $UseStap) {
     $DaemonEnabled          = 'off';
     $MasterProcessEnabled   = 'off';
 }
@@ -226,6 +299,22 @@ our $ConfDir    = File::Spec->catfile($ServRoot, 'conf');
 our $ConfFile   = File::Spec->catfile($ConfDir, 'nginx.conf');
 our $PidFile    = File::Spec->catfile($LogDir, 'nginx.pid');
 
+sub parse_time ($) {
+    my $tm = shift;
+
+    if (defined $tm) {
+        if ($tm =~ s/([^_a-zA-Z])ms$/$1/) {
+            $tm = $tm / 1000;
+        } elsif ($tm =~ s/([^_a-zA-Z])s$/$1/) {
+            # do nothing
+        } else {
+            # do nothing
+        }
+    }
+
+    return $tm;
+}
+
 sub html_dir () {
     return $HtmlDir;
 }
@@ -239,56 +328,89 @@ sub bail_out (@) {
     Test::More::BAIL_OUT(@_);
 }
 
-sub cleanup () {
-    if (!defined $ForkManager) {
-        return;
-    }
+sub kill_process ($$) {
+    my ($pid, $wait) = @_;
 
-    if ($Profiling || $UseValgrind) {
-        my $pid = $ChildPid;
+    if ($wait) {
         eval {
             if (defined $pid) {
+                if ($Verbose) {
+                    warn "sending QUIT signal to $pid";
+                }
+
                 kill(SIGQUIT, $pid);
+            }
+
+            if ($Verbose) {
+                warn "waitpid timeout: ", timeout();
             }
 
             local $SIG{ALRM} = sub { die "alarm\n" };
             alarm timeout();
-            $ForkManager->wait_all_children;
+            waitpid($pid, 0);
             alarm 0;
         };
 
-        if ($@) {
-            warn "WARNING: nginx/valgrind child process $pid timed out.\n";
-            my $i = 1;
-            while ($i <= 10) {
-                warn "Killing the child process $pid.\n";
-                if (kill(SIGQUIT, $pid) == 0) { # send quit signal
-                    warn("Failed to send quit signal to the child process with PID $pid.\n");
-                }
-
-                sleep $TestNginxSleep;
-
-                if (system("ps $pid > /dev/null") == 0) {
-                    if ($i < 10) {
-                        next;
-                    }
-
-                    warn "Killing the child process $pid with force.\n";
-                    kill(SIGKILL, $pid);
-                }
-
-            } continue {
-                $i++;
-            }
+        if (!$@) {
+            return;
         }
 
+        if ($Verbose) {
+            warn "WARNING: child process $pid timed out.\n";
+        }
+    }
+
+    my $i = 1;
+    while ($i <= 20) {
+        #warn "ps returns: ", system("ps -p $pid > /dev/stderr"), "\n";
+        #warn "$pid is running? ", is_running($pid) ? "Y" : "N", "\n";
+
+        if (!is_running($pid)) {
+            return;
+        }
+
+        if ($Verbose) {
+            warn "WARNING: killing the child process $pid.\n";
+        }
+
+        if (kill(SIGQUIT, $pid) == 0) { # send quit signal
+            warn "WARNING: failed to send quit signal to the child process with PID $pid.\n";
+        }
+
+        sleep $TestNginxSleep * $i;
+
+    } continue {
+        $i++;
+    }
+
+    warn "WARNING: killing the child process $pid with force...";
+
+    kill(SIGKILL, $pid);
+    waitpid($pid, 0);
+
+    sleep $TestNginxSleep;
+}
+
+sub cleanup () {
+    if (defined $UdpServerPid) {
+        kill_process($UdpServerPid, 1);
+        undef $UdpServerPid;
+    }
+
+    if (defined $TcpServerPid) {
+        kill_process($TcpServerPid, 1);
+        undef $TcpServerPid;
+    }
+
+    if (defined $ChildPid) {
+        kill_process($ChildPid, 1);
         undef $ChildPid;
     }
 }
 
 sub error_log_data () {
     # this is for logging in the log-phase which is after the serser closes the connection:
-    sleep $TestNginxSleep * 2;
+    sleep $TestNginxSleep * 3;
 
     open my $in, $ErrLogFile or
         return undef;
@@ -336,8 +458,16 @@ sub setup_server_root () {
 
             # Take special care, so we won't accidentally remove
             # real user data when TEST_NGINX_SERVROOT is mis-used.
-            system("rm -rf $ConfDir > /dev/null") == 0 or
-                bail_out "Can't remove $ConfDir";
+            my $rc = system("rm -rf $ConfDir > /dev/null");
+            if ($rc != 0) {
+                if ($rc == -1) {
+                    bail_out "Cannot remove $ConfDir: $rc: $!\n";
+
+                } else {
+                    bail_out "Can't remove $ConfDir: $rc";
+                }
+            }
+
             system("rm -rf $HtmlDir > /dev/null") == 0 or
                 bail_out "Can't remove $HtmlDir";
             system("rm -rf $LogDir > /dev/null") == 0 or
@@ -445,7 +575,7 @@ sub write_config_file ($$$) {
     if ($UseHup) {
         master_on(); # config reload is buggy when master is off
 
-    } elsif ($UseValgrind) {
+    } elsif ($UseValgrind || $UseStap) {
         master_off();
     }
 
@@ -491,11 +621,14 @@ env MOCKEAGAIN;
 env MOCKEAGAIN_WRITE_TIMEOUT_PATTERN;
 env LD_PRELOAD;
 env DYLD_INSERT_LIBRARIES;
+env LUA_PATH;
+env LUA_CPATH;
 
 $main_config
 
 http {
-    access_log $AccLogFile;
+    #access_log $AccLogFile;
+    access_log off;
 
     default_type text/plain;
     keepalive_timeout  68;
@@ -528,11 +661,29 @@ _EOC_
 _EOC_
     }
 
-    print $out <<_EOC_;
+    print $out "    }\n";
+
+    if ($UseHup) {
+        print $out <<_EOC_;
+    server {
+        listen          $ServerPort;
+        server_name     'Test-Nginx';
+
+        location = /ver {
+            return 200 '$ConfigVersion';
+        }
     }
+_EOC_
+    }
+
+    print $out <<_EOC_;
 }
 
+#timer_resolution 100ms;
+
 events {
+    #accept_mutex off;
+
     worker_connections  $WorkerConnections;
 _EOC_
 
@@ -591,6 +742,63 @@ sub show_all_chars ($) {
     $s =~ s/\r/\\r/gs;
     $s =~ s/\t/\\t/gs;
     $s;
+}
+
+sub test_config_version ($) {
+    my $name = shift;
+    my $total = 30;
+    my $sleep = sleep_time();
+    my $nsucc = 0;
+
+    #$ConfigVersion = '322';
+
+    for (my $tries = 1; $tries <= $total; $tries++) {
+
+        my $ver = `curl -s -S -H 'Host: Test-Nginx' --connect-timeout 2 'http://$ServerAddr:$ServerPort/ver'`;
+        #chop $ver;
+
+        if ($Verbose) {
+            warn "$name - ConfigVersion: $ver == $ConfigVersion\n";
+        }
+
+        if ($ver eq $ConfigVersion) {
+            $nsucc++;
+
+            if ($nsucc == 5) {
+                sleep $sleep;
+            }
+
+            if ($nsucc >= 10) {
+                #warn "MATCHED!!!\n";
+                return;
+            }
+
+            #sleep $sleep;
+            next;
+
+        } else {
+            if ($nsucc) {
+                if ($Verbose) {
+                    warn "$name - reset nsucc $nsucc\n";
+                }
+
+                $nsucc = 0;
+            }
+        }
+
+        my $wait = ($sleep + $sleep * $tries) * $tries / 2;
+        if ($wait > 1) {
+            $wait = 1;
+        }
+
+        if ($wait > 0.5) {
+            warn "$name - waiting $wait sec for nginx to reload the configuration\n";
+        }
+
+        sleep $wait;
+    }
+
+    Test::More::fail("$name - failed to reload configuration");
 }
 
 sub parse_headers ($) {
@@ -659,7 +867,13 @@ sub run_test ($) {
     my $should_restart = 1;
     my $should_reconfig = 1;
 
+    local $StapOutFile = $StapOutFile;
+
     #warn "run test\n";
+    local $LogLevel = $LogLevel;
+    if ($block->log_level) {
+        $LogLevel = $block->log_level;
+    }
 
     if (!defined $config) {
         if (!$NoNginxManager) {
@@ -814,6 +1028,10 @@ sub run_test ($) {
     if (!$NoNginxManager && !$should_skip && $should_restart) {
         #warn "HERE";
 
+        if ($UseHup) {
+            $ConfigVersion = gen_rand_str(10);
+        }
+
         if ($should_reconfig) {
             $PrevConfig = $config;
         }
@@ -836,7 +1054,7 @@ sub run_test ($) {
 
             #warn "HERE";
 
-            if (system("ps $pid > /dev/null") == 0) {
+            if (is_running($pid)) {
                 #warn "found running nginx...";
 
                 if ($UseHup) {
@@ -845,17 +1063,17 @@ sub run_test ($) {
                     write_config_file($config, $block->http_config, $block->main_config);
 
                     if ($Verbose) {
-                        warn "sending HUP signal to $pid.\n";
+                        warn "sending USR1 signal to $pid.\n";
                     }
-                    if (system("kill -HUP $pid") == 0) {
-                        sleep $TestNginxSleep * 2;
+                    if (system("kill -USR1 $pid") == 0) {
+                        sleep $TestNginxSleep;
 
                         if ($Verbose) {
-                            warn "sending USR1 signal to $pid.\n";
+                            warn "sending HUP signal to $pid.\n";
                         }
 
-                        if (system("kill -USR1 $pid") == 0) {
-                            sleep $TestNginxSleep;
+                        if (system("kill -HUP $pid") == 0) {
+                            sleep $TestNginxSleep * 3;
 
                             if ($Verbose) {
                                 warn "skip starting nginx from scratch\n";
@@ -866,6 +1084,8 @@ sub run_test ($) {
                             if ($UseValgrind) {
                                 warn "$name\n";
                             }
+
+                            test_config_version($name);
 
                             goto request;
 
@@ -880,25 +1100,33 @@ sub run_test ($) {
                     }
                 }
 
+                if ($Verbose) {
+                    warn "sending QUIT signal to $pid\n";
+                }
+
                 if (kill(SIGQUIT, $pid) == 0) { # send quit signal
                     #warn("$name - Failed to send quit signal to the nginx process with PID $pid");
                 }
 
                 sleep $TestNginxSleep;
 
-                if (system("ps $pid > /dev/null") == 0) {
-                    #warn "killing with force...\n";
+                if (is_running($pid)) {
+                    warn "WARNING: killing nginx $pid with force...";
                     kill(SIGKILL, $pid);
-                    sleep $TestNginxSleep;
+                    waitpid($pid, 0);
                 }
 
                 undef $nginx_is_running;
 
             } else {
-                unlink $PidFile or
-                    bail_out "Failed to remove pid file $PidFile\n";
+                if (-f $PidFile) {
+                    unlink $PidFile or
+                        warn "WARNING: failed to remove pid file $PidFile\n";
+                }
+
                 undef $nginx_is_running;
             }
+
         } else {
             undef $nginx_is_running;
         }
@@ -955,15 +1183,77 @@ start_nginx:
 
                 warn "$name\n";
                 #warn "$cmd\n";
+
+                undef $UseStap;
+
+            } elsif ($UseStap) {
+
+                if ($StapOutFileHandle) {
+                    close $StapOutFileHandle;
+                    undef $StapOutFileHandle;
+                }
+
+                if ($block->stap) {
+                    my ($stap_fh, $stap_fname) = tempfile("XXXXXXX", SUFFIX => '.stp', TMPDIR => 1);
+                    my $stap = $block->stap;
+                    $stap =~ s/^\bS\(([^)]+)\)/probe process("nginx").statement("*\@$1")/smg;
+                    $stap =~ s/^\bF\((\w+)\)/probe process("nginx").function("$1")/smg;
+                    $stap =~ s/^\bM\(([-\w]+)\)/probe process("nginx").mark("$1")/smg;
+                    $stap =~ s/\bT\(\)/println("Fire ", pp())/smg;
+                    print $stap_fh $stap;
+                    close $stap_fh;
+
+                    my ($out, $outfile);
+
+                    if (!defined $block->stap_out && !defined $block->stap_out_like) {
+                        $StapOutFile = "/dev/stderr";
+                    }
+
+                    if (!$StapOutFile) {
+                        ($out, $outfile) = tempfile("XXXXXXXX", SUFFIX => '.stp-out', TMPDIR => 1);
+                        close $out;
+
+                        $StapOutFile = $outfile;
+
+                    } else {
+                        $outfile = $StapOutFile;
+                    }
+
+                    open $out, $outfile or
+                        bail_out("Cannot open $outfile for reading: $!\n");
+
+                    $StapOutFileHandle = $out;
+                    if (defined $ENV{LD_PRELOAD}) {
+                        $cmd = qq!LD_PRELOAD="$ENV{LD_PRELOAD}" exec $cmd!;
+
+                    } else {
+                        $cmd = "exec $cmd";
+                    }
+
+                    $cmd = "stap-nginx -c '$cmd' -o $outfile $stap_fname";
+
+                    #warn "CMD: $cmd\n";
+
+                    warn "$name\n";
+                }
             }
 
-            if ($Profiling || $UseValgrind) {
-                my $pid = $ForkManager->start;
+            if ($Profiling || $UseValgrind || $UseStap) {
+                my $pid = fork();
 
-                if (!$pid) {
+                if (!defined $pid) {
+                    bail_out("$name - fork() failed: $!");
+
+                } elsif ($pid == 0) {
                     # child process
                     #my $rc = system($cmd);
-                    #$ForkManager->finish($rc);
+
+                    $InSubprocess = 1;
+
+                    if ($Verbose) {
+                        warn "command: $cmd\n";
+                    }
+
                     exec "exec $cmd";
 
                 } else {
@@ -1011,6 +1301,294 @@ request:
             warn "Run the test block...\n";
         }
 
+        if ($CheckLeak && defined $block->tcp_listen) {
+
+            my $n = defined($block->tcp_query_len) ? 1 : 0;
+            $n += defined($block->tcp_query) ? 1 : 0;
+
+            if ($n) {
+                SKIP: {
+                    Test::More::skip(qq{$name -- tests skipped because embedded TCP }
+                        .qq{server does not work with the "check leak" mode}, $n);
+                }
+            }
+        }
+
+        my $tcp_socket;
+        if (!$CheckLeak && defined $block->tcp_listen) {
+            my $port = $block->tcp_listen;
+            if ($port !~ /^\d+$/) {
+                bail_out("$name - bad tcp_listen port number: $port");
+            }
+
+            my $reply = $block->tcp_reply;
+            if (!defined $reply) {
+                bail_out("$name - no --- tcp_reply specified but --- tcp_listen is specified");
+            }
+
+            my $req_len = $block->tcp_query_len;
+
+            #warn "Reply: ", $reply;
+
+            my $err;
+            for (my $i = 0; $i < 30; $i++) {
+                $tcp_socket = IO::Socket::INET->new(
+                    LocalHost => '127.0.0.1',
+                    LocalPort => $port,
+                    Proto => 'tcp',
+                    Reuse => 1,
+                    Listen => 5,
+                    Timeout => timeout(),
+                );
+
+                if ($tcp_socket) {
+                    last;
+                }
+
+                if ($!) {
+                    $err = $!;
+                    if ($err =~ /address already in use/i) {
+                        warn "WARNING: failed to create the tcp listening socket: $err\n";
+                        sleep 1;
+                        next;
+                    }
+                }
+
+                last;
+            }
+
+            if (!$tcp_socket && $err) {
+                bail_out("$name - failed to create the tcp listening socket: $err");
+            }
+
+            if (defined $block->tcp_query || defined $req_len) {
+                my $tb = Test::More->builder;
+                $tb->use_numbers(0);
+                $tb->no_ending(1);
+            }
+
+            my $pid = fork();
+
+            if (!defined $pid) {
+                bail_out("$name - fork() failed: $!");
+
+            } elsif ($pid == 0) {
+                # child process
+                #my $rc = system($cmd);
+
+                $InSubprocess = 1;
+
+                if ($Verbose) {
+                    warn "TCP server is listening on $port ...\n";
+                }
+
+                local $| = 1;
+
+                my $client;
+
+                while (1) {
+                    $client = $tcp_socket->accept();
+                    last if $client;
+                    warn("WARNING: $name - TCP server: failed to accept: $!\n");
+                    sleep $TestNginxSleep;
+                }
+
+                my $buf;
+
+                while (1) {
+                    my $b;
+                    my $ret = $client->recv($b, 4096);
+                    if (!defined $ret) {
+                        die "failed to receive: $!\n";
+                    }
+
+                    $buf .= $b;
+
+                    if (!$req_len || length($buf) >= $req_len) {
+                        last;
+                    }
+                }
+
+                if (defined $req_len) {
+                    Test::More::is(length($buf), $req_len, "$name - req len ok");
+                }
+
+                if (defined $block->tcp_query) {
+                    if ($NoLongString) {
+                        Test::More::is($buf, $block->tcp_query, "$name - tcp_query ok");
+                    } else {
+                        is_string $buf, $block->tcp_query, "$name - tcp_query ok";
+                    }
+                }
+
+                if ($Verbose) {
+                    warn "tcp server received $buf\n";
+                }
+
+                my $delay = parse_time($block->tcp_reply_delay);
+                if ($delay) {
+                    if ($Verbose) {
+                        warn "sleep $delay before sending TCP reply\n";
+                    }
+                    sleep $delay;
+                }
+
+                if (defined $reply) {
+                    if (ref $reply) {
+                        for my $r (@$reply) {
+                            #warn "sending reply $r";
+                            my $bytes = $client->send($r);
+                            if (!defined $bytes) {
+                                warn "WARNING: tcp server failed to send reply: $!\n";
+                            }
+                        }
+
+                    } else {
+                        my $bytes = $client->send($reply);
+                        if (!defined $bytes) {
+                            warn "WARNING: tcp server failed to send reply: $!\n";
+                        }
+                    }
+                }
+
+                if ($Verbose) {
+                    warn "TCP server is shutting down...\n";
+                }
+
+                if (defined $block->tcp_no_close) {
+                    while (1) {
+                        sleep 1;
+                    }
+                }
+
+                $client->close();
+                $tcp_socket->close();
+
+                exit;
+
+            } else {
+                # main process
+                if ($Verbose) {
+                    warn "started sub-process $pid for the TCP server\n";
+                }
+
+                $TcpServerPid = $pid;
+            }
+        }
+
+        if ($CheckLeak && defined $block->udp_listen) {
+
+            my $n = defined($block->udp_query) ? 1 : 0;
+
+            if ($n) {
+                SKIP: {
+                    Test::More::skip(qq{$name -- tests skipped because embedded UDP }
+                        .qq{server does not work with the "check leak" mode}, $n);
+                }
+            }
+        }
+
+        my $udp_socket;
+        if (!$CheckLeak && defined $block->udp_listen) {
+            my $port = $block->udp_listen;
+            if ($port !~ /^\d+$/) {
+                bail_out("$name - bad udp_listen port number: $port");
+            }
+
+            my $reply = $block->udp_reply;
+            if (!defined $reply) {
+                bail_out("$name - no --- udp_reply specified but --- udp_listen is specified");
+            }
+
+            #warn "Reply: ", $reply;
+
+            $udp_socket = IO::Socket::INET->new(
+                LocalPort => $port,
+                Proto => 'udp',
+                Reuse => 1,
+                Timeout => timeout(),
+            ) or bail_out("$name - failed to create the udp listening socket: $!");
+
+            if (defined $block->udp_query) {
+                my $tb = Test::More->builder;
+                $tb->use_numbers(0);
+                $tb->no_ending(1);
+            }
+
+            my $pid = fork();
+
+            if (!defined $pid) {
+                bail_out("$name - fork() failed: $!");
+
+            } elsif ($pid == 0) {
+                # child process
+                #my $rc = system($cmd);
+
+                $InSubprocess = 1;
+
+                if ($Verbose) {
+                    warn "UDP server is listening on $port ...\n";
+                }
+
+                local $| = 1;
+
+                my $buf;
+                $udp_socket->recv($buf, 4096);
+
+                if (defined $block->udp_query) {
+                    if ($NoLongString) {
+                        Test::More::is($buf, $block->udp_query, "$name - udp_query ok");
+                    } else {
+                        is_string $buf, $block->udp_query, "$name - udp_query ok";
+                    }
+                }
+
+                if ($Verbose) {
+                    warn "udp server received $buf\n";
+                }
+
+                my $delay = parse_time($block->udp_reply_delay);
+                if ($delay) {
+                    if ($Verbose) {
+                        warn "sleep $delay before sending UDP reply\n";
+                    }
+                    sleep $delay;
+                }
+
+                if (defined $reply) {
+                    if (ref $reply) {
+                        for my $r (@$reply) {
+                            #warn "sending reply $r";
+                            my $bytes = $udp_socket->send($r);
+                            if (!defined $bytes) {
+                                warn "WARNING: udp server failed to send reply: $!\n";
+                            }
+                        }
+
+                    } else {
+                        my $bytes = $udp_socket->send($reply);
+                        if (!defined $bytes) {
+                            warn "WARNING: udp server failed to send reply: $!\n";
+                        }
+                    }
+                }
+
+                if ($Verbose) {
+                    warn "UDP server is shutting down...\n";
+                }
+
+                exit;
+
+            } else {
+                # main process
+                if ($Verbose) {
+                    warn "started sub-process $pid for the UDP server\n";
+                }
+
+                $UdpServerPid = $pid;
+            }
+        }
+
         if ($i > 1) {
             write_user_files($block);
         }
@@ -1021,15 +1599,49 @@ request:
 
                 $RunTestHelper->($block, $dry_run);
             }
+
         } elsif ($should_todo) {
             TODO: {
                 local $TODO = "$name - $todo_reason";
 
                 $RunTestHelper->($block, $dry_run);
             }
+
         } else {
             $RunTestHelper->($block, $dry_run);
         }
+
+        if (defined $udp_socket) {
+            if (defined $UdpServerPid) {
+                kill_process($UdpServerPid, 1);
+                undef $UdpServerPid;
+            }
+
+            $udp_socket->close();
+            undef $udp_socket;
+        }
+
+        if (defined $tcp_socket) {
+            if (defined $TcpServerPid) {
+                if ($Verbose) {
+                    warn "killing TCP server, pid $TcpServerPid\n";
+                }
+                kill_process($TcpServerPid, 1);
+                undef $TcpServerPid;
+            }
+
+            if ($Verbose) {
+                warn "closing the TCP socket\n";
+            }
+
+            $tcp_socket->close();
+            undef $tcp_socket;
+        }
+    }
+
+    if ($StapOutFileHandle) {
+        close $StapOutFileHandle;
+        undef $StapOutFileHandle;
     }
 
     if (my $total_errlog = $ENV{TEST_NGINX_ERROR_LOG}) {
@@ -1044,18 +1656,18 @@ request:
         }
     }
 
-    if (($Profiling || $UseValgrind) && !$UseHup) {
+    if (($Profiling || $UseValgrind || $UseStap) && !$UseHup) {
         #warn "Found quit...";
         if (-f $PidFile) {
             #warn "found pid file...";
             my $pid = get_pid_from_pidfile($name);
             my $i = 0;
 retry:
-            if (system("ps $pid > /dev/null") == 0) {
+            if (is_running($pid)) {
                 write_config_file($config, $block->http_config, $block->main_config);
 
                 if ($Verbose) {
-                    warn "sending QUIT signal to $pid\n";
+                    warn "sending QUIT signal to $pid";
                 }
 
                 if (kill(SIGQUIT, $pid) == 0) { # send quit signal
@@ -1074,12 +1686,11 @@ retry:
                     }
 
                     if ($Verbose) {
-                        warn "sending KILL signal to $pid\n";
+                        warn "sending KILL signal to $pid";
                     }
 
                     kill(SIGKILL, $pid);
-
-                    sleep $TestNginxSleep;
+                    waitpid($pid, 0);
 
                     unlink $PidFile or
                         bail_out "Failed to remove pid file $PidFile\n";
@@ -1099,25 +1710,34 @@ retry:
 }
 
 END {
-    if ($UseValgrind || !$ENV{TEST_NGINX_NO_CLEAN}) {
+    return if $InSubprocess;
+
+    cleanup();
+
+    if ($UseStap || $UseValgrind || !$ENV{TEST_NGINX_NO_CLEAN}) {
         local $?; # to avoid confusing Test::Builder::_ending
         if (-f $PidFile) {
             my $pid = get_pid_from_pidfile('');
             if (!$pid) {
                 bail_out "No pid found.";
             }
-            if (system("ps $pid > /dev/null") == 0) {
+            if (is_running($pid)) {
+                if ($Verbose) {
+                    warn "sending QUIT signal to $pid";
+                }
+
                 if (kill(SIGQUIT, $pid) == 0) { # send quit signal
                     #warn("Failed to send quit signal to the nginx process with PID $pid");
                 }
 
                 sleep $TestNginxSleep;
 
-                if (system("ps $pid > /dev/null") == 0) {
-                    #warn "killing with force...\n";
+                if (is_running($pid)) {
+                    warn "WARNING: killing nginx $pid with force...";
                     kill(SIGKILL, $pid);
-                    sleep $TestNginxSleep;
+                    waitpid($pid, 0);
                 }
+
             } else {
                 unlink $PidFile;
             }
@@ -1127,19 +1747,19 @@ END {
 
 # check if we can run some command
 sub can_run {
-	my ($cmd) = @_;
+    my ($cmd) = @_;
 
-        #warn "can run: @_\n";
-	my $_cmd = $cmd;
-	return $_cmd if (-x $_cmd or $_cmd = MM->maybe_command($_cmd));
+    #warn "can run: @_\n";
+    my $_cmd = $cmd;
+    return $_cmd if (-x $_cmd or $_cmd = MM->maybe_command($_cmd));
 
-	for my $dir ((split /$Config::Config{path_sep}/, $ENV{PATH}), '.') {
-		next if $dir eq '';
-		my $abs = File::Spec->catfile($dir, $_[0]);
-		return $abs if (-x $abs or $abs = MM->maybe_command($abs));
-	}
+    for my $dir ((split /$Config::Config{path_sep}/, $ENV{PATH}), '.') {
+        next if $dir eq '';
+        my $abs = File::Spec->catfile($dir, $_[0]);
+        return $abs if (-x $abs or $abs = MM->maybe_command($abs));
+    }
 
-	return;
+    return;
 }
 
 1;

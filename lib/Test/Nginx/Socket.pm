@@ -5,7 +5,7 @@ use lib 'inc';
 
 use Test::Base -Base;
 
-our $VERSION = '0.20';
+our $VERSION = '0.21';
 
 use POSIX qw( SIGQUIT SIGKILL SIGTERM SIGHUP );
 use Encode;
@@ -17,9 +17,18 @@ use List::Util qw( sum );
 use IO::Select ();
 use File::Temp qw( tempfile );
 
-our $ServerAddr = 'localhost';
-
 use Test::Nginx::Util qw(
+  is_running
+  $NoLongString
+  no_long_string
+  $ServerAddr
+  server_addr
+  parse_time
+  $UseStap
+  verbose
+  sleep_time
+  stap_out_fh
+  stap_out_fname
   setup_server_root
   write_config_file
   get_canon_version
@@ -63,8 +72,6 @@ use IO::Socket;
 
 #our ($PrevRequest, $PrevConfig);
 
-our $NoLongString = undef;
-
 our @EXPORT = qw( plan run_tests run_test
   repeat_each config_preamble worker_connections
   master_process_enabled
@@ -77,6 +84,7 @@ our @EXPORT = qw( plan run_tests run_test
 sub send_request ($$$$@);
 
 sub run_test_helper ($$);
+sub test_stap ($$);
 
 sub error_event_handler ($);
 sub read_event_handler ($);
@@ -85,21 +93,6 @@ sub check_response_body ($$$$$);
 sub fmt_str ($);
 sub gen_cmd_from_req ($);
 sub get_linear_regression_slope ($);
-
-sub no_long_string () {
-    $NoLongString = 1;
-}
-
-sub server_addr (@) {
-    if (@_) {
-
-        #warn "setting server addr to $_[0]\n";
-        $ServerAddr = shift;
-    }
-    else {
-        return $ServerAddr;
-    }
-}
 
 $RunTestHelper = \&run_test_helper;
 
@@ -468,8 +461,11 @@ sub run_test_helper ($$) {
         my $cmd = gen_cmd_from_req($req);
 
         # start a sub-process to run ab or weighttp
-        my $pid = $Test::Nginx::Util::ForkManager->start;
-        if (!$pid) {
+        my $pid = fork();
+        if (!defined $pid) {
+            bail_out("$name - fork() failed: $!");
+
+        } elsif ($pid == 0) {
             # child process
             exec @$cmd;
 
@@ -514,15 +510,16 @@ sub run_test_helper ($$) {
                 #warn "K = $k (2 expected)\n";
             }
 
-            if (system("ps $pid > /dev/null") == 0) {
+            if (is_running($pid)) {
                 kill(SIGKILL, $pid);
+                waitpid($pid, 0);
             }
         }
     }
 
     #warn "request: $req\n";
 
-    my $timeout = $block->timeout;
+    my $timeout = parse_time($block->timeout);
     if ( !defined $timeout ) {
         $timeout = timeout();
     }
@@ -553,6 +550,7 @@ sub run_test_helper ($$) {
 
 again:
         #warn "!!! resp: [$raw_resp]";
+
         if (!defined $raw_resp) {
             $raw_resp = '';
         }
@@ -560,6 +558,11 @@ again:
         my ( $res, $raw_headers, $left );
 
         if (!defined $block->ignore_response) {
+
+            if ($Test::Nginx::Util::Verbose) {
+                warn "parse response\n";
+            }
+
             ( $res, $raw_headers, $left ) = parse_response( $name, $raw_resp, $head_req );
         }
 
@@ -591,7 +594,79 @@ again:
             goto again;
         }
     }
+
+    #warn "Testing stap...\n";
+
+    test_stap($block, $dry_run);
 }
+
+
+sub test_stap ($$) {
+    my ($block, $dry_run) = @_;
+    return if !$block->{stap};
+
+    my $name = $block->name;
+
+    my $reason;
+
+    if ($dry_run) {
+        $reason = "the lack of directive $dry_run";
+    }
+
+    if (!$UseStap) {
+        $dry_run = 1;
+        $reason ||= "env TEST_NGINX_USE_STAP is not set";
+    }
+
+    my $fname = stap_out_fname();
+
+    if ($fname && ($fname eq '/dev/stdout' || $fname eq '/dev/stderr')) {
+        $dry_run = 1;
+        $reason ||= "TEST_NGINX_TAP_OUT is set to $fname";
+    }
+
+    my $stap_out = $block->stap_out;
+    my $stap_out_like = $block->stap_out_like;
+
+    SKIP: {
+        skip "$name - tests skipped due to $reason", 1 if $dry_run;
+
+        my $fh = stap_out_fh();
+        if (!$fh) {
+            bail_out("no stap output file handle found");
+        }
+
+        if (sleep_time() < 0.2) {
+            sleep 0.2;
+
+        } else {
+            sleep sleep_time();
+        }
+
+        my $out;
+        while (<$fh>) {
+            $out .= $_;
+        }
+
+        #warn "out: $out\n";
+
+        if (defined $stap_out) {
+
+            if ($NoLongString) {
+                is($out, $block->stap_out, "$name - stap output expected");
+            } else {
+                is_string($out, $block->stap_out, "$name - stap output expected");
+            }
+
+        } elsif (defined $stap_out_like) {
+            like($out || '', qr/$stap_out_like/sm, "$name - stap output matched pattern");
+
+        } else {
+            fail("$name - neither --- stap_out nor --- stap_out_like is specified");
+        }
+    }
+}
+
 
 #  Helper function to retrieve a "check" (e.g. error_code) section. This also
 # checks that tests with arrays of requests are arrays themselves.
@@ -618,12 +693,15 @@ sub get_indexed_value($$$$) {
     }
 }
 
-sub check_error_code($$$$$) {
+sub check_error_code ($$$$$) {
     my ($block, $res, $dry_run, $req_idx, $need_array) = @_;
+
     my $name = $block->name;
     SKIP: {
         skip "$name - tests skipped due to the lack of directive $dry_run", 1 if $dry_run;
+
         if ( defined $block->error_code_like ) {
+
             my $val = get_indexed_value($name, $block->error_code_like, $req_idx, $need_array);
             like( ($res && $res->code) || '',
                 qr/$val/sm,
@@ -633,6 +711,7 @@ sub check_error_code($$$$$) {
             is( ($res && $res->code) || '',
                 get_indexed_value($name, $block->error_code, $req_idx, $need_array),
                 "$name - status code ok" );
+
         } else {
             is( ($res && $res->code) || '', 200, "$name - status code ok" );
         }
@@ -1000,10 +1079,23 @@ sub send_request ($$$$@) {
     );
 
     if (! defined $sock) {
-        $tries ||= 0;
-        if ($tries < 10) {
-            warn "Can't connect to $ServerAddr:$ServerPortForClient: $!\n";
-            sleep 1;
+        $tries ||= 1;
+        my $total_tries = 30;
+        if ($tries <= $total_tries) {
+            my $wait = (sleep_time() + sleep_time() * $tries) * $tries / 2;
+            if ($wait >= 1) {
+                $wait = 1;
+            }
+
+            if ($wait >= 0.6) {
+                warn "Can't connect to $ServerAddr:$ServerPortForClient: $!\n";
+                if ($tries + 1 <= $total_tries) {
+                    warn "\tRetry connecting after $wait sec\n";
+                }
+            }
+
+            sleep $wait;
+
             #warn "sending request";
             return send_request($req, $middle_delay, $timeout, $name, $tries + 1);
 
@@ -1172,6 +1264,10 @@ sub send_request ($$$$@) {
 
 sub timeout_event_handler ($) {
     my $ctx = shift;
+
+    my $tb = Test::More->builder;
+    $tb->no_ending(1);
+
     fail("ERROR: client socket timed out - $ctx->{name}\n");
 }
 
@@ -1804,7 +1900,7 @@ of each request in the test.
 
 =head2 timeout
 
-Specify the timeout value (in seconds) for the HTTP client embeded into the test scaffold. This has nothing
+Specify the timeout value (in seconds) for the HTTP client embedded into the test scaffold. This has nothing
 to do with the server side configuration.
 
 Note that, just as almost all the timeout settings in the nginx world, this timeout
@@ -1827,6 +1923,12 @@ Here is an example:
     --- response_body
     ok
     --- timeout: 1.5
+
+An optional time unit can be specified, for example,
+
+    --- timeout: 50ms
+
+Acceptable time units are C<s> (seconds) and C<ms> (milliseconds). If no time unit is specified, then default to seconds.
 
 =head2 error_log
 
@@ -1881,6 +1983,28 @@ Just like the C<--- error_log> section, one can also specify multiple patterns:
 
 Then if any line in F<error.log> contains the string C<"abc"> or match the Perl regex C<qr/blah/>, then the test will fail.
 
+=head2 log_level
+
+Overrides the default error log level for the current test block.
+
+For example:
+
+    --- log_level: debug
+
+The default error log level can be specified in the Perl code by calling the `log_level()` function, as in
+
+    use Test::Nginx::Socket;
+
+    repeat_each(2);
+    plan tests => repeat_each() * (3 * blocks());
+
+    log_level('warn');
+
+    run_tests();
+
+    __DATA__
+    ...
+
 =head2 raw_request
 
 The exact request to send to nginx. This is useful when you want to test
@@ -1918,9 +2042,236 @@ server tested. The file will contain the text "Hello, world".
 
 =head2 skip_nginx
 
+Skip the specified number of subtests (in the current test block)
+for the specified version range of nginx.
+
+The format for this section is
+
+    --- skip_nginx
+    <subtest-count>: <op> <version>
+
+The <subtest-count> value must be a positive integer.
+The <op> value could be either C<< > >>, C<< >= >>, C<< < >>, or C<< <= >>. the <version> part is a valid nginx version number, like C<1.0.2>.
+
+An example is
+
+    === TEST 1: sample
+    --- config
+        location /t { echo hello; }
+    --- request
+        GET /t
+    --- response_body
+    --- skip_nginx
+    2: < 0.8.54
+
+That is, skipping 2 subtests in this test block for nginx versions older than 0.8.54.
+
+This C<skip_nginx> section only allows you to specify one boolean expression as
+the skip condition. If you want to use two boolean expressions, you should use the C<skip_nginx2> section instead.
+
 =head2 skip_nginx2
 
-Both string scalar and string arrays are supported as values.
+This seciton is similar to C<skip_nginx>, but the skip condition consists of two boolean expressions joined by the operator C<and> or C<or>.
+
+The format for this section is
+
+    --- skip_nginx2
+    <subtest-count>: <op> <version> and|or <op> <version>
+
+For example:
+
+    === TEST 1: sample
+    --- config
+        location /t { echo hello; }
+    --- request
+        GET /t
+    --- response_body
+    --- skip_nginx2
+    2: < 0.8.53 and >= 0.8.41
+
+=head2 stap
+
+This section is used to specify user systemtap script file (.stp file)
+
+Here's an example:
+
+    === TEST 1: stap sample
+    --- config
+        location /t { echo hello; }
+    --- stap
+    probe process("nginx").function("ngx_http_finalize_request")
+    {
+        printf("finalize %s?%s\n", ngx_http_req_uri($r),
+               ngx_http_req_args($r))
+    }
+    --- stap_out
+    finalize /test?a=3&b=4
+    --- request
+    GET /test?a=3&b=4
+    --- response_body
+    hello
+
+There's some macros that can be used in the "--- stap" section value. These macros
+will be expanded by the test scaffold automatically.
+
+=over
+
+=item C<F(function_name)>
+
+This expands to C<probe process("nginx").function("function_name")>. For example,
+ the sample above can be rewritten as
+
+    === TEST 1: stap sample
+    --- config
+        location /t { echo hello; }
+    --- stap
+    F(ngx_http_finalize_request)
+    {
+        printf("finalize %s?%s\n", ngx_http_req_uri($r),
+               ngx_http_req_args($r))
+    }
+    --- stap_out
+    finalize /test?a=3&b=4
+    --- request
+    GET /test?a=3&b=4
+    --- response_body
+    hello
+
+=item C<T()>
+
+This macro will be expanded to C<println("Fire ", pp())>.
+
+=item C<M(static-probe-name)>
+
+This macro will be expanded to C<probe process("nginx").mark("static-probe-name")>.
+
+For example,
+
+    M(http-subrequest-start)
+    {
+        ...
+    }
+
+will be expanded to
+
+    probe process("nginx").mark("http-subrequest-start")
+    {
+        ...
+    }
+
+=back
+
+=head2 stap_out
+
+This seciton specifies the expected literal output of the systemtap script specified by C<stap>.
+
+=head2 stap_out_like
+
+Just like C<stap_out>, but specify a Perl regex pattern instead.
+
+=head2 udp_listen
+
+Instantiates a UDP server listening on the port specified in the background for the test
+case to access. The server will be started and shut down at each iteration of the test case
+(if repeat_each is set to 3, then there are 3 iterations).
+
+The UDP server will first read and discard a datagram and then send back a datagram with the content
+specified by the C<udp_reply> section value.
+
+Here is an example:
+
+    === TEST 1: udp access
+    --- config
+        location = /t {
+            content_by_lua '
+                local udp = ngx.socket.udp()
+                udp:setpeername("127.0.0.1", 19232)
+                udp:send("blah")
+                local data, err = udp:receive()
+                ngx.say("received: ", data)
+            ';
+        }
+    --- udp_listen: 19232
+    --- udp_reply: hello world
+    --- request
+    GET /t
+    --- response_body
+    received: hello world
+
+=head2 udp_reply
+
+This section specifies the datagram reply content for the UDP server created by the C<udp_listen> section.
+
+You can also specify a delay time before sending out the reply via the C<udp_reply_delay> section. By default, there is no delay.
+
+An array value can be specified to make the embedded UDP server to send mulitple replies as specified, for example:
+
+    --- udp_reply eval
+    [ "hello", "world" ]
+
+See the C<udp_listen> section for more details.
+
+=head2 udp_reply_delay
+
+This section specifies the delay time before sending out the reply specified by the C<udp_reply> section.
+
+It is C<0> delay by default.
+
+An optional time unit can be specified, for example,
+
+    --- udp_reply_delay: 50ms
+
+Acceptable time units are C<s> (seconds) and C<ms> (milliseconds). If no time unit is specified, then default to seconds.
+
+=head2 udp_query
+
+Tests whether the UDP query sent to the embedded UDP server is equal to what is specified by this directive.
+
+For example,
+
+    === TEST 1: udp access
+    --- config
+        location = /t {
+            content_by_lua '
+                local udp = ngx.socket.udp()
+                udp:setpeername("127.0.0.1", 19232)
+                udp:send("blah")
+                local data, err = udp:receive()
+                ngx.say("received: ", data)
+            ';
+        }
+    --- udp_listen: 19232
+    --- udp_reply: hello world
+    --- request
+    GET /t
+    --- udp_query: hello world
+    --- response_body
+    received: hello world
+
+=head2 tcp_listen
+
+Just like C<udp_listen>, but starts an embedded TCP server listening on the port specified.
+
+=head2 tcp_no_close
+
+When this section is present, the embedded TCP server (if any) will not close
+the current TCP connection.
+
+=head2 tcp_reply_delay
+
+Just like C<udp_reply_delay>, but for the embedded TCP server.
+
+=head2 tcp_reply
+
+Just like C<tcp_reply>, but for the embedded TCP server.
+
+=head2 tcp_query
+
+Just like C<udp_query>, but for the embedded TCP server.
+
+=head2 tcp_query_len
+
+Specifies the expected TCP query received by the embedded TCP server.
 
 =head2 raw_request_middle_delay
 
@@ -2037,6 +2388,22 @@ a valgrind.suppress file.
 If this environment is set to the number C<1> or any other
 non-zero numbers, then it is equivalent to taking the value
 C<--tool=memcheck --leak-check=full>.
+
+=head2 TEST_NGINX_USE_STAP
+
+When set to true values (like 1), the test scaffold will use systemtap to instrument the nginx
+process.
+
+You can specify the stap script in the C<stap> section.
+
+Note that you need to use the C<stap-nginx> script from the C<nginx-dtrace> project.
+
+=head2 TEST_NGINX_STAP_OUT
+
+You can specify the output file for the systemtap tool. By default, a random file name
+under the system temporary directory is generated.
+
+It's common to specify C<TEST_NGINX_STAP_OUT=/dev/stderr> when debugging.
 
 =head2 TEST_NGINX_BINARY
 

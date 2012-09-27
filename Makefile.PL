@@ -26,8 +26,7 @@ requires        ('List::Util');
 requires        ('Encode');
 requires        ('ExtUtils::MakeMaker');
 requires        ('File::Find');
-
-requires        ('Parallel::ForkManager');
+requires        ('IO::Socket::INET');
 
 use_test_base();
 auto_install();
