@@ -3,7 +3,7 @@ package Test::Nginx::Util;
 use strict;
 use warnings;
 
-our $VERSION = '0.21';
+our $VERSION = '0.22';
 
 use base 'Exporter';
 
@@ -13,16 +13,18 @@ use HTTP::Response;
 use Cwd qw( cwd );
 use List::Util qw( shuffle );
 use Time::HiRes qw( sleep );
-use ExtUtils::MakeMaker ();
 use File::Path qw(make_path);
 use File::Find qw(find);
 use File::Temp qw( tempfile );
 use IO::Socket::INET;
+use IO::Socket::UNIX;
 use Test::LongString;
 
 our $ConfigVersion;
+our $FilterHttpConfig;
 
 our $NoLongString = undef;
+our $FirstTime = 1;
 
 our $UseHup = $ENV{TEST_NGINX_USE_HUP};
 
@@ -59,6 +61,42 @@ our $StapOutFileHandle;
 
 our @RandStrAlphabet = ('A' .. 'Z', 'a' .. 'z', '0' .. '9',
     '#', '@', '-', '_', '^');
+
+if ($CheckLeak) {
+    if ($UseStap) {
+        warn "WARNING: TEST_NGINX_CHECK_LEAK and TEST_NGINX_USE_STAP "
+             ."are both set and the former wins.\n";
+        undef $UseStap;
+    }
+
+    if ($UseValgrind) {
+        warn "WARNING: TEST_NGINX_CHECK_LEAK and TEST_NGINX_USE_VALGRIND "
+             ."are both set and the former wins.\n";
+        undef $UseValgrind;
+    }
+
+    if ($UseHup) {
+        warn "WARNING: TEST_NGINX_CHECK_LEAK and TEST_NGINX_USE_HUP "
+             ."are both set and the former wins.\n";
+        undef $UseHup;
+    }
+}
+
+if ($UseHup) {
+    if ($UseStap) {
+        warn "WARNING: TEST_NGINX_USE_HUP and TEST_NGINX_USE_STAP "
+             ."are both set and the former wins.\n";
+        undef $UseStap;
+    }
+}
+
+if ($UseValgrind) {
+    if ($UseStap) {
+        warn "WARNING: TEST_NGINX_USE_VALGRIND and TEST_NGINX_USE_STAP "
+             ."are both set and the former wins.\n";
+        undef $UseStap;
+    }
+}
 
 #$SIG{CHLD} = 'IGNORE';
 
@@ -249,6 +287,7 @@ our @EXPORT_OK = qw(
     $ServRoot
     $ConfFile
     $RunTestHelper
+    $FilterHttpConfig
     $NoNginxManager
     $RepeatEach
     $CheckLeak
@@ -426,6 +465,10 @@ sub run_tests () {
         #warn "[INFO] Using nginx version $NginxVersion ($NginxRawVersion)\n";
     }
 
+    if (!defined $ENV{TEST_NGINX_SERVER_PORT}) {
+        $ENV{TEST_NGINX_SERVER_PORT} = $ServerPort;
+    }
+
     for my $block ($NoShuffle ? Test::Base::blocks() : shuffle Test::Base::blocks()) {
         run_test($block);
     }
@@ -589,6 +632,10 @@ sub write_config_file ($$$) {
         $http_config = '';
     }
 
+    if ($FilterHttpConfig) {
+        $http_config = $FilterHttpConfig->($http_config)
+    }
+
     if ($http_config =~ /\bpostpone_output\b/) {
         undef $PostponeOutput;
     }
@@ -606,6 +653,7 @@ sub write_config_file ($$$) {
 
     if ($CheckLeak) {
         $LogLevel = 'warn';
+        $AccLogFile = 'off';
     }
 
     open my $out, ">$ConfFile" or
@@ -627,8 +675,8 @@ env LUA_CPATH;
 $main_config
 
 http {
-    #access_log $AccLogFile;
-    access_log off;
+    access_log $AccLogFile;
+    #access_log off;
 
     default_type text/plain;
     keepalive_timeout  68;
@@ -746,7 +794,7 @@ sub show_all_chars ($) {
 
 sub test_config_version ($) {
     my $name = shift;
-    my $total = 30;
+    my $total = 35;
     my $sleep = sleep_time();
     my $nsucc = 0;
 
@@ -797,6 +845,9 @@ sub test_config_version ($) {
 
         sleep $wait;
     }
+
+    my $tb = Test::More->builder;
+    $tb->no_ending(1);
 
     Test::More::fail("$name - failed to reload configuration");
 }
@@ -859,6 +910,12 @@ sub run_test ($) {
     my $block = shift;
     my $name = $block->name;
 
+    my $first_time;
+    if ($FirstTime) {
+        $first_time = 1;
+        undef $FirstTime;
+    }
+
     my $config = $block->config;
 
     $config = expand_env_in_config($config);
@@ -916,8 +973,26 @@ sub run_test ($) {
 
     my $skip_nginx = $block->skip_nginx;
     my $skip_nginx2 = $block->skip_nginx2;
+    my $skip_eval = $block->skip_eval;
     my $skip_slave = $block->skip_slave;
     my ($tests_to_skip, $should_skip, $skip_reason);
+
+    if (defined $skip_eval) {
+        if ($skip_eval =~ m{
+                ^ \s* (\d+) \s* : \s* (.*)
+            }xs)
+        {
+            $tests_to_skip = $1;
+            $skip_reason = "skip_eval";
+            my $code = $2;
+            $should_skip = eval $code;
+            if ($@) {
+                bail_out("$name - skip_eval - failed to eval the Perl code "
+                         . "\"$code\": $@");
+            }
+        }
+    }
+
     if (defined $skip_nginx) {
         if ($skip_nginx =~ m{
                 ^ \s* (\d+) \s* : \s*
@@ -1058,6 +1133,27 @@ sub run_test ($) {
                 #warn "found running nginx...";
 
                 if ($UseHup) {
+                    if ($first_time) {
+                        if ($Verbose) {
+                            warn "sending QUIT signal to $pid\n";
+                        }
+
+                        if (kill(SIGQUIT, $pid) == 0) { # send quit signal
+                            #warn("$name - Failed to send quit signal to the nginx process with PID $pid");
+                        }
+
+                        sleep $TestNginxSleep;
+
+                        if (is_running($pid)) {
+                            warn "WARNING: killing nginx $pid with force...";
+                            kill(SIGKILL, $pid);
+                            waitpid($pid, 0);
+                        }
+
+                        undef $nginx_is_running;
+                        goto start_nginx;
+                    }
+
                     setup_server_root();
                     write_user_files($block);
                     write_config_file($config, $block->http_config, $block->main_config);
@@ -1145,7 +1241,7 @@ start_nginx:
             write_user_files($block);
             write_config_file($config, $block->http_config, $block->main_config);
             #warn "nginx binary: $NginxBinary";
-            if ( ! can_run($NginxBinary) ) {
+            if (!can_run($NginxBinary)) {
                 bail_out("$name - Cannot find the nginx executable in the PATH environment");
                 die;
             }
@@ -1168,7 +1264,7 @@ start_nginx:
                 my $opts;
 
                 if ($UseValgrind =~ /^\d+$/) {
-                    $opts = "--tool=memcheck --leak-check=full";
+                    $opts = "--tool=memcheck --leak-check=full --show-possibly-lost=no";
 
                     if (-f 'valgrind.suppress') {
                         $cmd = "valgrind -q $opts --gen-suppressions=all --suppressions=valgrind.suppress $cmd";
@@ -1196,8 +1292,25 @@ start_nginx:
                 if ($block->stap) {
                     my ($stap_fh, $stap_fname) = tempfile("XXXXXXX", SUFFIX => '.stp', TMPDIR => 1);
                     my $stap = $block->stap;
+
+                    if ($stap =~ /\$LIBPCRE_PATH\b/) {
+                        my $nginx_path = can_run($NginxBinary);
+                        #warn "nginx path: ", $nginx_path;
+                        my $line = `ldd $nginx_path|grep libpcre.so`;
+                        my $libpcre_path;
+                        if ($line =~ m{\S+/libpcre\.so(?:\.\d+)*}) {
+                            $libpcre_path = $&;
+
+                        } else {
+                            # static linking is used?
+                            $libpcre_path = $nginx_path;
+                        }
+
+                        $stap =~ s/\$LIBPCRE_PATH\b/$libpcre_path/g;
+                    }
+
                     $stap =~ s/^\bS\(([^)]+)\)/probe process("nginx").statement("*\@$1")/smg;
-                    $stap =~ s/^\bF\((\w+)\)/probe process("nginx").function("$1")/smg;
+                    $stap =~ s/^\bF\(([^\)]+)\)/probe process("nginx").function("$1")/smg;
                     $stap =~ s/^\bM\(([-\w]+)\)/probe process("nginx").mark("$1")/smg;
                     $stap =~ s/\bT\(\)/println("Fire ", pp())/smg;
                     print $stap_fh $stap;
@@ -1205,7 +1318,10 @@ start_nginx:
 
                     my ($out, $outfile);
 
-                    if (!defined $block->stap_out && !defined $block->stap_out_like) {
+                    if (!defined $block->stap_out
+                        && !defined $block->stap_out_like
+                        && !defined $block->stap_out_unlike)
+                    {
                         $StapOutFile = "/dev/stderr";
                     }
 
@@ -1488,26 +1604,43 @@ request:
             }
         }
 
-        my $udp_socket;
+        my ($udp_socket, $uds_socket_file);
         if (!$CheckLeak && defined $block->udp_listen) {
-            my $port = $block->udp_listen;
-            if ($port !~ /^\d+$/) {
-                bail_out("$name - bad udp_listen port number: $port");
-            }
-
             my $reply = $block->udp_reply;
             if (!defined $reply) {
                 bail_out("$name - no --- udp_reply specified but --- udp_listen is specified");
             }
 
-            #warn "Reply: ", $reply;
+            my $target = $block->udp_listen;
+            if ($target =~ /^\d+$/) {
+                my $port = $target;
 
-            $udp_socket = IO::Socket::INET->new(
-                LocalPort => $port,
-                Proto => 'udp',
-                Reuse => 1,
-                Timeout => timeout(),
-            ) or bail_out("$name - failed to create the udp listening socket: $!");
+                $udp_socket = IO::Socket::INET->new(
+                    LocalPort => $port,
+                    Proto => 'udp',
+                    Reuse => 1,
+                    Timeout => timeout(),
+                ) or bail_out("$name - failed to create the udp listening socket: $!");
+
+            } elsif ($target =~ m{\S+\.sock$}) {
+                if (-e $target) {
+                    unlink $target or die "cannot remove $target: $!";
+                }
+
+                $udp_socket = IO::Socket::UNIX->new(
+                    Local => $target,
+                    Type  => SOCK_DGRAM,
+                    Reuse => 1,
+                    Timeout => timeout(),
+                ) or die "$!";
+
+                $uds_socket_file = $target;
+
+            } else {
+                bail_out("$name - bad udp_listen target: $target");
+            }
+
+            #warn "Reply: ", $reply;
 
             if (defined $block->udp_query) {
                 my $tb = Test::More->builder;
@@ -1527,7 +1660,7 @@ request:
                 $InSubprocess = 1;
 
                 if ($Verbose) {
-                    warn "UDP server is listening on $port ...\n";
+                    warn "UDP server is listening on $target ...\n";
                 }
 
                 local $| = 1;
@@ -1619,6 +1752,11 @@ request:
 
             $udp_socket->close();
             undef $udp_socket;
+        }
+
+        if (defined $uds_socket_file) {
+            unlink($uds_socket_file)
+                or warn "failed to unlink $uds_socket_file";
         }
 
         if (defined $tcp_socket) {
@@ -1750,13 +1888,13 @@ sub can_run {
     my ($cmd) = @_;
 
     #warn "can run: @_\n";
-    my $_cmd = $cmd;
-    return $_cmd if (-x $_cmd or $_cmd = MM->maybe_command($_cmd));
+    #my $_cmd = $cmd;
+    #return $_cmd if (-x $_cmd or $_cmd = MM->maybe_command($_cmd));
 
     for my $dir ((split /$Config::Config{path_sep}/, $ENV{PATH}), '.') {
         next if $dir eq '';
         my $abs = File::Spec->catfile($dir, $_[0]);
-        return $abs if (-x $abs or $abs = MM->maybe_command($abs));
+        return $abs if -f $abs && -x $abs;
     }
 
     return;

@@ -5,7 +5,7 @@ use lib 'inc';
 
 use Test::Base -Base;
 
-our $VERSION = '0.21';
+our $VERSION = '0.22';
 
 use POSIX qw( SIGQUIT SIGKILL SIGTERM SIGHUP );
 use Encode;
@@ -16,6 +16,7 @@ use List::MoreUtils qw( any );
 use List::Util qw( sum );
 use IO::Select ();
 use File::Temp qw( tempfile );
+use POSIX ":sys_wait_h";
 
 use Test::Nginx::Util qw(
   is_running
@@ -45,6 +46,7 @@ use Test::Nginx::Util qw(
   $ServRoot
   $ConfFile
   $RunTestHelper
+  $FilterHttpConfig
   $RepeatEach
   $CheckLeak
   timeout
@@ -81,6 +83,9 @@ our @EXPORT = qw( plan run_tests run_test
   timeout no_nginx_manager
 );
 
+our $TotalConnectingTimeouts = 0;
+our $PrevNginxPid;
+
 sub send_request ($$$$@);
 
 sub run_test_helper ($$);
@@ -93,8 +98,13 @@ sub check_response_body ($$$$$);
 sub fmt_str ($);
 sub gen_cmd_from_req ($);
 sub get_linear_regression_slope ($);
+sub value_contains ($$);
 
 $RunTestHelper = \&run_test_helper;
+
+sub set_http_config_filter ($) {
+    $FilterHttpConfig = shift;
+}
 
 #  This will parse a "request"" string. The expected format is:
 # - One line for the HTTP verb (POST, GET, etc.) plus optional relative URL
@@ -471,12 +481,39 @@ sub run_test_helper ($$) {
 
         } else {
             # main process
+
+            $Test::Nginx::Util::ChildPid = $pid;
+
+            sleep(1);
             my $ngx_pid = get_pid_from_pidfile($name);
-            sleep 1;
+            if ($PrevNginxPid && $ngx_pid) {
+                my $i = 0;
+                while ($ngx_pid == $PrevNginxPid) {
+                    sleep 0.01;
+                    $ngx_pid = get_pid_from_pidfile($name);
+                    if (++$i > 1000) {
+                        bail_out("nginx cannot be started");
+                    }
+                }
+            }
+            $PrevNginxPid = $ngx_pid;
             my @rss_list;
             for (my $i = 0; $i < 100; $i++) {
                 sleep 0.02;
                 my $out = `ps -eo pid,rss|grep $ngx_pid`;
+                if ($? != 0 && !is_running($ngx_pid)) {
+                    if (is_running($pid)) {
+                        kill(SIGKILL, $pid);
+                        waitpid($pid, 0);
+                    }
+
+                    my $tb = Test::More->builder;
+                    $tb->no_ending(1);
+
+                    Test::More::fail("$name - the nginx process $ngx_pid is gone");
+                    last;
+                }
+
                 my @lines = grep { $_->[0] eq $ngx_pid }
                                  map { s/^\s+|\s+$//g; [ split /\s+/, $_ ] }
                                  split /\n/, $out;
@@ -524,7 +561,10 @@ sub run_test_helper ($$) {
         $timeout = timeout();
     }
 
+    my $res;
     my $req_idx = 0;
+    my ($n, $need_array);
+
     for my $one_req (@$r_req_list) {
         my ($raw_resp, $head_req);
 
@@ -533,12 +573,10 @@ sub run_test_helper ($$) {
 
         } else {
             ($raw_resp, $head_req) = send_request( $one_req, $block->raw_request_middle_delay,
-                $timeout, $block->name );
+                $timeout, $block );
         }
 
         #warn "raw resonse: [$raw_resp]\n";
-
-        my ($n, $need_array);
 
         if ($block->pipelined_requests) {
             $n = @{ $block->pipelined_requests };
@@ -555,7 +593,7 @@ again:
             $raw_resp = '';
         }
 
-        my ( $res, $raw_headers, $left );
+        my ( $raw_headers, $left );
 
         if (!defined $block->ignore_response) {
 
@@ -586,7 +624,9 @@ again:
             check_response_body($block, $res, $dry_run, $req_idx, $need_array);
         }
 
-        check_error_log($block, $res, $dry_run, $req_idx, $need_array);
+        if ($n || $req_idx < @$r_req_list - 1) {
+            check_error_log($block, $res, $dry_run, $req_idx, $need_array);
+        }
 
         $req_idx++;
 
@@ -595,9 +635,17 @@ again:
         }
     }
 
-    #warn "Testing stap...\n";
+    if ($block->wait) {
+        sleep($block->wait);
+    }
+
+    if ($Test::Nginx::Util::Verbose) {
+        warn "Testing stap...\n";
+    }
 
     test_stap($block, $dry_run);
+
+    check_error_log($block, $res, $dry_run, $req_idx, $need_array);
 }
 
 
@@ -627,42 +675,54 @@ sub test_stap ($$) {
 
     my $stap_out = $block->stap_out;
     my $stap_out_like = $block->stap_out_like;
+    my $stap_out_unlike = $block->stap_out_unlike;
 
     SKIP: {
-        skip "$name - tests skipped due to $reason", 1 if $dry_run;
+        skip "$name - stap_out - tests skipped due to $reason", 1 if $dry_run;
 
         my $fh = stap_out_fh();
         if (!$fh) {
             bail_out("no stap output file handle found");
         }
 
-        if (sleep_time() < 0.2) {
-            sleep 0.2;
+        my $out = '';
+        for (1..2) {
+            if (sleep_time() < 0.2) {
+                sleep 0.2;
 
-        } else {
-            sleep sleep_time();
+            } else {
+                sleep sleep_time();
+            }
+
+            while (<$fh>) {
+                $out .= $_;
+            }
+
+            if ($out) {
+                last;
+            }
         }
 
-        my $out;
-        while (<$fh>) {
-            $out .= $_;
+        if ($Test::Nginx::Util::Verbose) {
+            warn "stap out: $out\n";
         }
-
-        #warn "out: $out\n";
 
         if (defined $stap_out) {
-
             if ($NoLongString) {
                 is($out, $block->stap_out, "$name - stap output expected");
             } else {
                 is_string($out, $block->stap_out, "$name - stap output expected");
             }
+        }
 
-        } elsif (defined $stap_out_like) {
-            like($out || '', qr/$stap_out_like/sm, "$name - stap output matched pattern");
+        if (defined $stap_out_like) {
+            like($out || '', qr/$stap_out_like/sm,
+                 "$name - stap output should match the pattern");
+        }
 
-        } else {
-            fail("$name - neither --- stap_out nor --- stap_out_like is specified");
+        if (defined $stap_out_unlike) {
+            unlike($out || '', qr/$stap_out_unlike/sm,
+                   "$name - stap output should not match the pattern");
         }
     }
 }
@@ -721,14 +781,25 @@ sub check_error_code ($$$$$) {
 sub check_raw_response_headers($$$$$) {
     my ($block, $raw_headers, $dry_run, $req_idx, $need_array) = @_;
     my $name = $block->name;
-    if ( defined $block->raw_response_headers_like ) {
+    if (defined $block->raw_response_headers_like) {
         SKIP: {
-            skip "$name - tests skipped due to the lack of directive $dry_run", 1 if $dry_run;
+            skip "$name - raw_response_headers_like - tests skipped due to the lack of directive $dry_run", 1 if $dry_run;
             my $expected = get_indexed_value($name,
                                              $block->raw_response_headers_like,
                                              $req_idx,
                                              $need_array);
             like $raw_headers, qr/$expected/s, "$name - raw resp headers like";
+        }
+    }
+
+    if (defined $block->raw_response_headers_unlike) {
+        SKIP: {
+            skip "$name - raw_response_headers_unlike - tests skipped due to the lack of directive $dry_run", 1 if $dry_run;
+            my $expected = get_indexed_value($name,
+                                             $block->raw_response_headers_unlike,
+                                             $req_idx,
+                                             $need_array);
+            unlike $raw_headers, qr/$expected/s, "$name - raw resp headers unlike";
         }
     }
 }
@@ -746,7 +817,7 @@ sub check_response_headers($$$$$) {
 
                 #warn "HIT";
                 SKIP: {
-                    skip "$name - tests skipped due to the lack of directive $dry_run", 1 if $dry_run;
+                    skip "$name - response_headers - tests skipped due to the lack of directive $dry_run", 1 if $dry_run;
                     unlike $raw_headers, qr/^\s*\Q$key\E\s*:/ms,
                       "$name - header $key not present in the raw headers";
                 }
@@ -759,7 +830,7 @@ sub check_response_headers($$$$$) {
             }
 
             SKIP: {
-                skip "$name - tests skipped due to the lack of directive $dry_run", 1 if $dry_run;
+                skip "$name - response_headers - tests skipped due to the lack of directive $dry_run", 1 if $dry_run;
                 is $actual_val, $val, "$name - header $key ok";
             }
         }
@@ -775,11 +846,29 @@ sub check_response_headers($$$$$) {
                 $expected_val = '';
             }
             SKIP: {
-                skip "$name - tests skipped due to the lack of directive $dry_run", 1 if $dry_run;
+                skip "$name - response_headers_like - tests skipped due to the lack of directive $dry_run", 1 if $dry_run;
                 like $expected_val, qr/^$val$/, "$name - header $key like ok";
             }
         }
     }
+}
+
+sub value_contains ($$) {
+    my ($val, $pat) = @_;
+
+    if (!ref $val || ref $val eq 'Regexp') {
+        return $val =~ /\Q$pat\E/;
+    }
+
+    if (ref $val eq 'ARRAY') {
+        for my $v (@$val) {
+            if (value_contains($v, $pat)) {
+                return 1;
+            }
+        }
+    }
+
+    return undef;
 }
 
 sub check_error_log ($$$$$) {
@@ -787,8 +876,20 @@ sub check_error_log ($$$$$) {
     my $name = $block->name;
     my $lines;
 
+    my $check_alert_message = 1;
+    my $check_crit_message = 1;
+
     if (defined $block->error_log) {
         my $pats = $block->error_log;
+
+        if (value_contains($pats, "[alert")) {
+            undef $check_alert_message;
+        }
+
+        if (value_contains($pats, "[crit")) {
+            undef $check_crit_message;
+        }
+
         if (!ref $pats) {
             chomp $pats;
             my @lines = split /\n+/, $pats;
@@ -808,7 +909,7 @@ sub check_error_log ($$$$$) {
                 next if !defined $pat;
                 if (ref $pat && $line =~ /$pat/ || $line =~ /\Q$pat\E/) {
                     SKIP: {
-                        skip "$name - tests skipped due to the lack of directive $dry_run", 1 if $dry_run;
+                        skip "$name - error_log - tests skipped due to the lack of directive $dry_run", 1 if $dry_run;
                         pass("$name - pattern \"$pat\" matches a line in error.log");
                     }
                     undef $pat;
@@ -819,7 +920,7 @@ sub check_error_log ($$$$$) {
         for my $pat (@$pats) {
             if (defined $pat) {
                 SKIP: {
-                    skip "$name - tests skipped due to the lack of directive $dry_run", 1 if $dry_run;
+                    skip "$name - error_log - tests skipped due to the lack of directive $dry_run", 1 if $dry_run;
                     fail("$name - pattern \"$pat\" matches a line in error.log");
                     #die join("", @$lines);
                 }
@@ -830,6 +931,15 @@ sub check_error_log ($$$$$) {
     if (defined $block->no_error_log) {
         #warn "HERE";
         my $pats = $block->no_error_log;
+
+        if (value_contains($pats, "[alert")) {
+            undef $check_alert_message;
+        }
+
+        if (value_contains($pats, "[crit")) {
+            undef $check_crit_message;
+        }
+
         if (!ref $pats) {
             chomp $pats;
             my @lines = split /\n+/, $pats;
@@ -847,7 +957,7 @@ sub check_error_log ($$$$$) {
                 #warn "test $pat\n";
                 if ((ref $pat && $line =~ /$pat/) || $line =~ /\Q$pat\E/) {
                     SKIP: {
-                        skip "$name - tests skipped due to the lack of directive $dry_run", 1 if $dry_run;
+                        skip "$name - no_error_log - tests skipped due to the lack of directive $dry_run", 1 if $dry_run;
                         my $ln = fmt_str($line);
                         my $p = fmt_str($pat);
                         fail("$name - pattern \"$p\" should not match any line in error.log but matches line \"$ln\"");
@@ -860,7 +970,7 @@ sub check_error_log ($$$$$) {
         for my $pat (@$pats) {
             if (defined $pat) {
                 SKIP: {
-                    skip "$name - tests skipped due to the lack of directive $dry_run", 1 if $dry_run;
+                    skip "$name - no_error_log - tests skipped due to the lack of directive $dry_run", 1 if $dry_run;
                     my $p = fmt_str($pat);
                     pass("$name - pattern \"$p\" does not match a line in error.log");
                 }
@@ -868,6 +978,27 @@ sub check_error_log ($$$$$) {
         }
     }
 
+    if ($check_alert_message && !$dry_run) {
+        $lines ||= error_log_data();
+        for my $line (@$lines) {
+            #warn "test $pat\n";
+            if ($line =~ /\[alert\]/) {
+                my $ln = fmt_str($line);
+                warn("WARNING: $name - $ln");
+            }
+        }
+    }
+
+    if ($check_crit_message && !$dry_run) {
+        $lines ||= error_log_data();
+        for my $line (@$lines) {
+            #warn "test $pat\n";
+            if ($line =~ /\[crit\]/) {
+                my $ln = fmt_str($line);
+                warn("WARNING: $name - $ln");
+            }
+        }
+    }
 }
 
 sub fmt_str ($) {
@@ -922,7 +1053,7 @@ sub check_response_body ($$$$$) {
 
         #warn "no long string: $NoLongString";
         SKIP: {
-            skip "$name - tests skipped due to the lack of directive $dry_run", 1 if $dry_run;
+            skip "$name - response_body - tests skipped due to the lack of directive $dry_run", 1 if $dry_run;
             if (ref $expected) {
                 like $content, $expected, "$name - response_body - like";
 
@@ -957,7 +1088,7 @@ sub check_response_body ($$$$$) {
         }
 
         SKIP: {
-            skip "$name - tests skipped due to the lack of directive $dry_run", 1 if $dry_run;
+            skip "$name - response_body_like - tests skipped due to the lack of directive $dry_run", 1 if $dry_run;
             like( $content, qr/$expected_pat/s,
                 "$name - response_body_like - response is expected ($summary)"
             );
@@ -1001,6 +1132,7 @@ sub parse_response($$$) {
 
                 last;
             }
+
             if ( $raw =~ m{ \G [\ \t]* ( [A-Fa-f0-9]+ ) [\ \t]* \r\n }gcsx ) {
                 my $rest = hex($1);
 
@@ -1014,28 +1146,41 @@ sub parse_response($$$) {
                         $decoded .= $1;
 
                         #warn "decoded: [$1]\n";
-                    }
-                    else {
-                        fail(
-"$name - invalid chunked data received (not enought octets for the data section)"
+
+                    } else {
+                        my $tb = Test::More->builder;
+                        $tb->no_ending(1);
+
+                        fail("$name - invalid chunked data received "
+                                ."(not enought octets for the data section)"
                         );
                         return;
                     }
 
                     $rest -= $bit;
                 }
+
                 if ( $raw !~ /\G\r\n/gcs ) {
+                    my $tb = Test::More->builder;
+                    $tb->no_ending(1);
+
                     fail(
                         "$name - invalid chunked data received (expected CRLF)."
                     );
                     return;
                 }
-            }
-            elsif ( $raw =~ /\G.+/gcs ) {
+
+            } elsif ( $raw =~ /\G.+/gcs ) {
+                my $tb = Test::More->builder;
+                $tb->no_ending(1);
+
                 fail "$name - invalid chunked body received: $&";
                 return;
-            }
-            else {
+
+            } else {
+                my $tb = Test::More->builder;
+                $tb->no_ending(1);
+
                 fail "$name - no last chunk found - $raw";
                 return;
             }
@@ -1064,7 +1209,9 @@ sub parse_response($$$) {
 }
 
 sub send_request ($$$$@) {
-    my ( $req, $middle_delay, $timeout, $name, $tries ) = @_;
+    my ( $req, $middle_delay, $timeout, $block, $tries ) = @_;
+
+    my $name = $block->name;
 
     #warn "connecting...\n";
 
@@ -1078,17 +1225,30 @@ sub send_request ($$$$@) {
         Timeout   => $timeout,
     );
 
-    if (! defined $sock) {
+    if (!defined $sock) {
         $tries ||= 1;
-        my $total_tries = 30;
+        my $total_tries = $TotalConnectingTimeouts ? 20 : 50;
         if ($tries <= $total_tries) {
             my $wait = (sleep_time() + sleep_time() * $tries) * $tries / 2;
             if ($wait >= 1) {
                 $wait = 1;
             }
 
+            if (defined $Test::Nginx::Util::ChildPid) {
+                my $errcode = $!;
+                if (waitpid($Test::Nginx::Util::ChildPid, WNOHANG) == -1) {
+                    warn "WARNING: Child process $Test::Nginx::Util::ChildPid is already gone.\n";
+
+                    my $tb = Test::More->builder;
+                    $tb->no_ending(1);
+
+                    fail("$name - Can't connect to $ServerAddr:$ServerPortForClient: $errcode (aborted)\n");
+                    return;
+                }
+            }
+
             if ($wait >= 0.6) {
-                warn "Can't connect to $ServerAddr:$ServerPortForClient: $!\n";
+                warn "$name - Can't connect to $ServerAddr:$ServerPortForClient: $!\n";
                 if ($tries + 1 <= $total_tries) {
                     warn "\tRetry connecting after $wait sec\n";
                 }
@@ -1097,11 +1257,21 @@ sub send_request ($$$$@) {
             sleep $wait;
 
             #warn "sending request";
-            return send_request($req, $middle_delay, $timeout, $name, $tries + 1);
+            return send_request($req, $middle_delay, $timeout, $block, $tries + 1);
 
         }
 
-        bail_out("Can't connect to $ServerAddr:$ServerPortForClient: $! (Aborted)\n");
+        my $msg = "$name - Can't connect to $ServerAddr:$ServerPortForClient: $! (aborted)\n";
+        if (++$TotalConnectingTimeouts < 3) {
+            my $tb = Test::More->builder;
+            $tb->no_ending(1);
+            fail($msg);
+
+        } else {
+            bail_out($msg);
+        }
+
+        return;
     }
 
     #warn "connected";
@@ -1133,6 +1303,7 @@ sub send_request ($$$$@) {
         middle_delay => $middle_delay,
         sock         => $sock,
         name         => $name,
+        block        => $block,
     };
 
     my $readable_hdls = IO::Select->new($sock);
@@ -1252,6 +1423,18 @@ sub send_request ($$$$@) {
                 close $hdl;
 
             } elsif ( $res == 2 ) {
+                # all data has been written
+
+                my $shutdown = $block->shutdown;
+                if (defined $shutdown) {
+                    if ($shutdown =~ /^$/s) {
+                        $shutdown = 1;
+                    }
+
+                    #warn "shutting down with $shutdown";
+                    shutdown($sock, $shutdown);
+                }
+
                 if ( $writable_hdls->exists($hdl) ) {
                     $writable_hdls->remove($hdl);
                 }
@@ -1265,10 +1448,17 @@ sub send_request ($$$$@) {
 sub timeout_event_handler ($) {
     my $ctx = shift;
 
-    my $tb = Test::More->builder;
-    $tb->no_ending(1);
+    close($ctx->{sock});
 
-    fail("ERROR: client socket timed out - $ctx->{name}\n");
+    if (!defined $ctx->{block}->abort) {
+        my $tb = Test::More->builder;
+        $tb->no_ending(1);
+
+        fail("ERROR: client socket timed out - $ctx->{name}\n");
+
+    } else {
+        sleep 0.005;
+    }
 }
 
 sub error_event_handler ($) {
@@ -1319,19 +1509,30 @@ sub write_event_handler ($) {
 
             #warn "wrote $bytes bytes.\n";
             $ctx->{write_offset} += $bytes;
-        }
-        else {
-            my $next_send = shift @{ $ctx->{req_bits} } or return 2;
+
+        } else {
+            # $rest == 0
+
+            my $next_send = shift @{ $ctx->{req_bits} };
+
+            if (!defined $next_send) {
+                return 2;
+            }
+
             $ctx->{write_buf} = $next_send->{'value'};
             $ctx->{write_offset} = 0;
+
             my $wait_time;
+
             if (!defined $next_send->{'delay_before'}) {
                 if (defined $ctx->{middle_delay}) {
                     $wait_time = $ctx->{middle_delay};
                 }
+
             } else {
                 $wait_time = $next_send->{'delay_before'};
             }
+
             if ($wait_time) {
                 #warn "sleeping..";
                 sleep $wait_time;
@@ -1485,7 +1686,11 @@ sub get_linear_regression_slope ($) {
     my $x = 0;
     my $avg_xy = sum(map { $x++; $x * $_ } @$list) / $n;
     my $avg_x2 = sum(map { $_ * $_ } 1 .. $n) / $n;
-    my $k = ($avg_xy - $avg_x * $avg_y) / ($avg_x2 - $avg_x * $avg_x);
+    my $denom = $avg_x2 - $avg_x * $avg_x;
+    if ($denom == 0) {
+        return 'Inf';
+    }
+    my $k = ($avg_xy - $avg_x * $avg_y) / $denom;
     return sprintf("%.01f", $k);
 }
 
@@ -1877,6 +2082,11 @@ test) is listening to:
 As usual, if the test is made of multiple requests, then
 raw_response_headers_like B<MUST> be an array.
 
+=head2 raw_response_headers_unlike
+
+Just like C<raw_response_headers_like> but the subtest only passes when
+the regex does I<not> match the raw response headers string.
+
 =head2 error_code
 
 The expected value of the HTTP response code. If not set, this is assumed
@@ -1901,14 +2111,16 @@ of each request in the test.
 =head2 timeout
 
 Specify the timeout value (in seconds) for the HTTP client embedded into the test scaffold. This has nothing
-to do with the server side configuration.
+to do with the server side configuration. When the timeout expires, the test scaffold will immediately
+close the socket for connecting to the Nginx server being tested.
 
-Note that, just as almost all the timeout settings in the nginx world, this timeout
+Note that, just as almost all the timeout settings in the Nginx world, this timeout
 also specifies the maximum waiting time between two successive I/O events on the same socket handle,
 rather than the total waiting time for the current socket operation.
 
 When the timeout setting expires, a test failure will be
-triggered with the message "ERROR: client socket timed out - TEST NAME".
+triggered with the message "ERROR: client socket timed out - TEST NAME", unless you have specified
+C<--- abort> at the same time.
 
 Here is an example:
 
@@ -1963,6 +2175,20 @@ Multiple patterns are also supported, for example:
 
 then the substring "abc" must appear literally in a line of F<error.log>, and the regex C<qr/blah>
 must also match a line in F<error.log>.
+
+=head2 abort
+
+Makes the test scaffold not to treat C<--- timeout> expiration as a test failure.
+
+=head2 shutdown
+
+Perform a C<shutdown>() operaton on the client socket connecting to Nginx as soon as sending out
+all the request data. This section takes an (optional) integer value for the argument to the
+C<shutdown> function call. For example,
+
+    --- shutdown: 1
+
+will make the connection stop sending data, which is the default.
 
 =head2 no_error_log
 
@@ -2039,6 +2265,24 @@ html directory of the nginx server under test. For example:
 
 will create a file named C<blah.txt> in the html directory of the nginx
 server tested. The file will contain the text "Hello, world".
+
+=head2 skip_eval
+
+Skip the specified number of subtests (in the current test block) if the result of running a piece of Perl code is true.
+
+The format for this section is
+
+    --- skip_eval
+    <subtest-count>: <perl-code>
+
+For example, to skip 3 subtests when the current operating system is not Linux:
+
+    --- skip_eval
+    3: $^O ne 'linux'
+
+or equivalently,
+
+    --- skip_eval: 3: $^O ne 'linux'
 
 =head2 skip_nginx
 
@@ -2169,6 +2413,15 @@ This seciton specifies the expected literal output of the systemtap script speci
 
 Just like C<stap_out>, but specify a Perl regex pattern instead.
 
+=head2 stap_out_unlike
+
+Just like C<stap_like>, but the subtest only passes when the specified pattern does I<not> match the output of the systemtap script.
+
+=head2 wait
+
+Takes an integer value for the seconds of time to wait right after processing the Nginx response and
+before performing the error log and systemtap output checks.
+
 =head2 udp_listen
 
 Instantiates a UDP server listening on the port specified in the background for the test
@@ -2192,6 +2445,26 @@ Here is an example:
             ';
         }
     --- udp_listen: 19232
+    --- udp_reply: hello world
+    --- request
+    GET /t
+    --- response_body
+    received: hello world
+
+Datagram UNIX domain socket is also supported if a path name ending with ".sock" is given to this directive. For instance,
+
+    === TEST 2: datagram unix domain socket access
+    --- config
+        location = /t {
+            content_by_lua '
+                local udp = ngx.socket.udp()
+                udp:setpeername("unix:a.sock")
+                udp:send("blah")
+                local data, err = udp:receive()
+                ngx.say("received: ", data)
+            ';
+        }
+    --- udp_listen: a.sock
     --- udp_reply: hello world
     --- request
     GET /t
@@ -2364,6 +2637,12 @@ For example, setting TEST_NGINX_POSTPONE_OUTPUT to 1 will have the following lin
     postpone_output 1;
 
 and it will effectively disable the write buffering in nginx's ngx_http_write_module.
+
+=head2 TEST_NGINX_NO_CLEAN
+
+When this environment is set to 1, it will prevent the test scaffold from quitting the Nginx server
+at the end of the run. This is very useful when you want to use other tools like gdb or curl
+inspect the Nginx server manually afterwards.
 
 =head2 TEST_NGINX_NO_NGINX_MANAGER
 
@@ -2563,7 +2842,7 @@ in his Debian repository: http://debian.perusio.net
 
 =head1 AUTHORS
 
-agentzh (章亦春) C<< <agentzh@gmail.com> >>
+Yichun "agentzh" Zhang (章亦春) C<< <agentzh@gmail.com> >>
 
 Antoine BONAVITA C<< <antoine.bonavita@gmail.com> >>
 
