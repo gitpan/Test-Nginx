@@ -3,7 +3,7 @@ package Test::Nginx::Util;
 use strict;
 use warnings;
 
-our $VERSION = '0.22';
+our $VERSION = '0.23';
 
 use base 'Exporter';
 
@@ -15,7 +15,7 @@ use List::Util qw( shuffle );
 use Time::HiRes qw( sleep );
 use File::Path qw(make_path);
 use File::Find qw(find);
-use File::Temp qw( tempfile );
+use File::Temp qw( tempfile :POSIX );
 use IO::Socket::INET;
 use IO::Socket::UNIX;
 use Test::LongString;
@@ -55,12 +55,18 @@ our $Timeout = $ENV{TEST_NGINX_TIMEOUT} || 3;
 
 our $CheckLeak = $ENV{TEST_NGINX_CHECK_LEAK} || 0;
 
-our $ServerAddr = 'localhost';
+our $CheckAccumErrLog = $ENV{TEST_NGINX_CHECK_ACCUM_ERR_LOG};
+
+our $ServerAddr = '127.0.0.1';
+
+our $ServerName = 'localhost';
 
 our $StapOutFileHandle;
 
 our @RandStrAlphabet = ('A' .. 'Z', 'a' .. 'z', '0' .. '9',
     '#', '@', '-', '_', '^');
+
+our $ErrLogFilePos;
 
 if ($CheckLeak) {
     if ($UseStap) {
@@ -133,6 +139,15 @@ sub server_addr (@) {
     }
 }
 
+sub server_name (@) {
+    if (@_) {
+        $ServerName = shift;
+
+    } else {
+        return $ServerName;
+    }
+}
+
 sub stap_out_fh {
     return $StapOutFileHandle;
 }
@@ -194,6 +209,14 @@ sub server_port (@) {
     }
 }
 
+sub server_port_for_client (@) {
+    if (@_) {
+        $ServerPortForClient = shift;
+    } else {
+        $ServerPortForClient;
+    }
+}
+
 sub repeat_each (@) {
     if (@_) {
         if ($CheckLeak) {
@@ -234,6 +257,10 @@ sub log_level (@) {
     }
 }
 
+sub check_accum_error_log () {
+    $CheckAccumErrLog = 1;
+}
+
 sub master_on () {
     if ($CheckLeak) {
         return;
@@ -258,11 +285,14 @@ sub master_process_enabled (@) {
 }
 
 our @EXPORT_OK = qw(
+    check_accum_error_log
     is_running
     $NoLongString
     no_long_string
     $ServerAddr
     server_addr
+    $ServerName
+    server_name
     parse_time
     $UseStap
     verbose
@@ -305,6 +335,7 @@ our @EXPORT_OK = qw(
     html_dir
     server_root
     server_port
+    server_port_for_client
     no_nginx_manager
 );
 
@@ -453,7 +484,17 @@ sub error_log_data () {
 
     open my $in, $ErrLogFile or
         return undef;
+
+    if (!$CheckAccumErrLog && $ErrLogFilePos > 0) {
+        seek $in, $ErrLogFilePos, 0;
+    }
+
     my @lines = <$in>;
+
+    if (!$CheckAccumErrLog) {
+        $ErrLogFilePos = tell($in);
+    }
+
     close $in;
     return \@lines;
 }
@@ -612,8 +653,8 @@ sub write_user_files ($) {
     }
 }
 
-sub write_config_file ($$$) {
-    my ($config, $http_config, $main_config) = @_;
+sub write_config_file ($$$$) {
+    my ($config, $http_config, $main_config, $post_main_config) = @_;
 
     if ($UseHup) {
         master_on(); # config reload is buggy when master is off
@@ -651,6 +692,10 @@ sub write_config_file ($$$) {
         $main_config = '';
     }
 
+    if (!defined $post_main_config) {
+        $post_main_config = '';
+    }
+
     if ($CheckLeak) {
         $LogLevel = 'warn';
         $AccLogFile = 'off';
@@ -668,9 +713,10 @@ env MOCKEAGAIN_VERBOSE;
 env MOCKEAGAIN;
 env MOCKEAGAIN_WRITE_TIMEOUT_PATTERN;
 env LD_PRELOAD;
+env LD_LIBRARY_PATH;
 env DYLD_INSERT_LIBRARIES;
-env LUA_PATH;
-env LUA_CPATH;
+#env LUA_PATH;
+#env LUA_CPATH;
 
 $main_config
 
@@ -685,7 +731,7 @@ $http_config
 
     server {
         listen          $ServerPort;
-        server_name     'localhost';
+        server_name     '$ServerName';
 
         client_max_body_size 30M;
         #client_body_buffer_size 4k;
@@ -727,6 +773,8 @@ _EOC_
     print $out <<_EOC_;
 }
 
+$post_main_config
+
 #timer_resolution 100ms;
 
 events {
@@ -755,7 +803,7 @@ sub get_nginx_version () {
     if (!defined $out || $? != 0) {
         warn "Failed to get the version of the Nginx in PATH.\n";
     }
-    if ($out =~ m{(?:nginx|ngx_openresty)/(\d+)\.(\d+)\.(\d+)}s) {
+    if ($out =~ m{(?:nginx|openresty)/(\d+)\.(\d+)\.(\d+)}s) {
         $NginxRawVersion = "$1.$2.$3";
         return get_canon_version($1, $2, $3);
     }
@@ -977,6 +1025,10 @@ sub run_test ($) {
     my $skip_slave = $block->skip_slave;
     my ($tests_to_skip, $should_skip, $skip_reason);
 
+    if ($CheckLeak && defined $block->no_check_leak) {
+        $should_skip = 1;
+    }
+
     if (defined $skip_eval) {
         if ($skip_eval =~ m{
                 ^ \s* (\d+) \s* : \s* (.*)
@@ -1142,10 +1194,14 @@ sub run_test ($) {
                             #warn("$name - Failed to send quit signal to the nginx process with PID $pid");
                         }
 
-                        sleep $TestNginxSleep;
+                        my $max_i = 15;
+                        for (my $i = 1; $i <= $max_i; $i++) {
+                            last unless is_running($pid);
 
-                        if (is_running($pid)) {
-                            warn "WARNING: killing nginx $pid with force...";
+                            sleep $TestNginxSleep;
+                            next if $i < $max_i;
+
+                            warn "WARNING: $name - killing nginx $pid with force...";
                             kill(SIGKILL, $pid);
                             waitpid($pid, 0);
                         }
@@ -1156,7 +1212,9 @@ sub run_test ($) {
 
                     setup_server_root();
                     write_user_files($block);
-                    write_config_file($config, $block->http_config, $block->main_config);
+                    write_config_file($config, $block->http_config,
+                                      $block->main_config,
+                                      $block->post_main_config);
 
                     if ($Verbose) {
                         warn "sending USR1 signal to $pid.\n";
@@ -1204,10 +1262,14 @@ sub run_test ($) {
                     #warn("$name - Failed to send quit signal to the nginx process with PID $pid");
                 }
 
-                sleep $TestNginxSleep;
+                my $max_i = 15;
+                for (my $i = 1; $i <= $max_i; $i++) {
+                    last unless is_running($pid);
 
-                if (is_running($pid)) {
-                    warn "WARNING: killing nginx $pid with force...";
+                    sleep $TestNginxSleep;
+                    next if $i < $max_i;
+
+                    warn "WARNING: $name - killing nginx $pid with force...";
                     kill(SIGKILL, $pid);
                     waitpid($pid, 0);
                 }
@@ -1239,7 +1301,8 @@ start_nginx:
             #warn "*** Restarting the nginx server...\n";
             setup_server_root();
             write_user_files($block);
-            write_config_file($config, $block->http_config, $block->main_config);
+            write_config_file($config, $block->http_config,
+                              $block->main_config, $block->post_main_config);
             #warn "nginx binary: $NginxBinary";
             if (!can_run($NginxBinary)) {
                 bail_out("$name - Cannot find the nginx executable in the PATH environment");
@@ -1267,9 +1330,9 @@ start_nginx:
                     $opts = "--tool=memcheck --leak-check=full --show-possibly-lost=no";
 
                     if (-f 'valgrind.suppress') {
-                        $cmd = "valgrind -q $opts --gen-suppressions=all --suppressions=valgrind.suppress $cmd";
+                        $cmd = "valgrind --num-callers=100 -q $opts --gen-suppressions=all --suppressions=valgrind.suppress $cmd";
                     } else {
-                        $cmd = "valgrind -q $opts --gen-suppressions=all $cmd";
+                        $cmd = "valgrind --num-callers=100 -q $opts --gen-suppressions=all $cmd";
                     }
 
                 } else {
@@ -1292,6 +1355,23 @@ start_nginx:
                 if ($block->stap) {
                     my ($stap_fh, $stap_fname) = tempfile("XXXXXXX", SUFFIX => '.stp', TMPDIR => 1);
                     my $stap = $block->stap;
+
+                    if ($stap =~ /\$LIBLUA_PATH\b/) {
+                        my $nginx_path = can_run($NginxBinary);
+                        #warn "nginx path: ", $nginx_path;
+                        my $line = `ldd $nginx_path|grep -E 'liblua.*?\.so'`;
+                        warn "line: $line";
+                        my $liblua_path;
+                        if ($line =~ m{\S+/liblua.*?\.so(?:\.\d+)*}) {
+                            $liblua_path = $&;
+
+                        } else {
+                            # static linking is used?
+                            $liblua_path = $nginx_path;
+                        }
+
+                        $stap =~ s/\$LIBLUA_PATH\b/$liblua_path/g;
+                    }
 
                     if ($stap =~ /\$LIBPCRE_PATH\b/) {
                         my $nginx_path = can_run($NginxBinary);
@@ -1339,11 +1419,14 @@ start_nginx:
                         bail_out("Cannot open $outfile for reading: $!\n");
 
                     $StapOutFileHandle = $out;
-                    if (defined $ENV{LD_PRELOAD}) {
-                        $cmd = qq!LD_PRELOAD="$ENV{LD_PRELOAD}" exec $cmd!;
+                    $cmd = "exec $cmd";
 
-                    } else {
-                        $cmd = "exec $cmd";
+                    if (defined $ENV{LD_PRELOAD}) {
+                        $cmd = qq!LD_PRELOAD="$ENV{LD_PRELOAD}" $cmd!;
+                    }
+
+                    if (defined $ENV{LD_LIBRARY_PATH}) {
+                        $cmd = qq!LD_LIBRARY_PATH="$ENV{LD_LIBRARY_PATH}" $cmd!;
                     }
 
                     $cmd = "stap-nginx -c '$cmd' -o $outfile $stap_fname";
@@ -1363,6 +1446,9 @@ start_nginx:
                 } elsif ($pid == 0) {
                     # child process
                     #my $rc = system($cmd);
+
+                    my $tb = Test::More->builder;
+                    $tb->no_ending(1);
 
                     $InSubprocess = 1;
 
@@ -1384,7 +1470,7 @@ start_nginx:
                     if ($ENV{TEST_NGINX_IGNORE_MISSING_DIRECTIVES} and
                             my $directive = check_if_missing_directives())
                     {
-                        $dry_run = $directive;
+                        $dry_run = "the lack of directive $directive";
 
                     } else {
                         bail_out("$name - Cannot start nginx using command \"$cmd\".");
@@ -1410,6 +1496,7 @@ request:
     }
 
     my $i = 0;
+    $ErrLogFilePos = 0;
     while ($i++ < $RepeatEach) {
         #warn "Use hup: $UseHup, i: $i\n";
 
@@ -1430,12 +1517,10 @@ request:
             }
         }
 
-        my $tcp_socket;
+        my ($tcp_socket, $tcp_query_file);
         if (!$CheckLeak && defined $block->tcp_listen) {
-            my $port = $block->tcp_listen;
-            if ($port !~ /^\d+$/) {
-                bail_out("$name - bad tcp_listen port number: $port");
-            }
+
+            my $target = $block->tcp_listen;
 
             my $reply = $block->tcp_reply;
             if (!defined $reply) {
@@ -1444,18 +1529,37 @@ request:
 
             my $req_len = $block->tcp_query_len;
 
+            if (defined $block->tcp_query || defined $req_len) {
+                $tcp_query_file = tmpnam();
+            }
+
             #warn "Reply: ", $reply;
 
             my $err;
             for (my $i = 0; $i < 30; $i++) {
-                $tcp_socket = IO::Socket::INET->new(
-                    LocalHost => '127.0.0.1',
-                    LocalPort => $port,
-                    Proto => 'tcp',
-                    Reuse => 1,
-                    Listen => 5,
-                    Timeout => timeout(),
-                );
+                if ($target =~ /^\d+$/) {
+                    $tcp_socket = IO::Socket::INET->new(
+                        LocalHost => '127.0.0.1',
+                        LocalPort => $target,
+                        Proto => 'tcp',
+                        Reuse => 1,
+                        Listen => 5,
+                        Timeout => timeout(),
+                    );
+                } elsif ($target =~ m{\S+\.sock$}) {
+                    if (-e $target) {
+                        unlink $target or die "cannot remove $target: $!";
+                    }
+
+                    $tcp_socket = IO::Socket::UNIX->new(
+                        Local => $target,
+                        Type  => SOCK_STREAM,
+                        Listen => 5,
+                        Timeout => timeout(),
+                    );
+                } else {
+                    bail_out("$name - bad tcp_listen target: $target");
+                }
 
                 if ($tcp_socket) {
                     last;
@@ -1465,6 +1569,22 @@ request:
                     $err = $!;
                     if ($err =~ /address already in use/i) {
                         warn "WARNING: failed to create the tcp listening socket: $err\n";
+                        if ($i >= 20) {
+                            my $pids = `fuser -n tcp $target`;
+                            if ($pids) {
+                                $pids =~ s/^\s+|\s+$//g;
+                                my @pids = split /\s+/, $pids;
+                                for my $pid (@pids) {
+                                    if ($pid == $$) {
+                                        warn "WARNING: Test::Nginx leaks mocked TCP sockets on target $target\n";
+                                        next;
+                                    }
+
+                                    warn "WARNING: killing process $pid listening on target $target.\n";
+                                    kill_process($pid, 1);
+                                }
+                            }
+                        }
                         sleep 1;
                         next;
                     }
@@ -1477,12 +1597,6 @@ request:
                 bail_out("$name - failed to create the tcp listening socket: $err");
             }
 
-            if (defined $block->tcp_query || defined $req_len) {
-                my $tb = Test::More->builder;
-                $tb->use_numbers(0);
-                $tb->no_ending(1);
-            }
-
             my $pid = fork();
 
             if (!defined $pid) {
@@ -1490,12 +1604,16 @@ request:
 
             } elsif ($pid == 0) {
                 # child process
+
+                my $tb = Test::More->builder;
+                $tb->no_ending(1);
+
                 #my $rc = system($cmd);
 
                 $InSubprocess = 1;
 
                 if ($Verbose) {
-                    warn "TCP server is listening on $port ...\n";
+                    warn "TCP server is listening on $target ...\n";
                 }
 
                 local $| = 1;
@@ -1525,20 +1643,16 @@ request:
                     }
                 }
 
-                if (defined $req_len) {
-                    Test::More::is(length($buf), $req_len, "$name - req len ok");
-                }
+                if ($tcp_query_file) {
+                    open my $out, ">$tcp_query_file"
+                        or die "cannot open $tcp_query_file for writing: $!\n";
 
-                if (defined $block->tcp_query) {
-                    if ($NoLongString) {
-                        Test::More::is($buf, $block->tcp_query, "$name - tcp_query ok");
-                    } else {
-                        is_string $buf, $block->tcp_query, "$name - tcp_query ok";
+                    if ($Verbose) {
+                        warn "writing received data [$buf] to file $tcp_query_file\n";
                     }
-                }
 
-                if ($Verbose) {
-                    warn "tcp server received $buf\n";
+                    print $out $buf;
+                    close $out;
                 }
 
                 my $delay = parse_time($block->tcp_reply_delay);
@@ -1604,11 +1718,15 @@ request:
             }
         }
 
-        my ($udp_socket, $uds_socket_file);
+        my ($udp_socket, $uds_socket_file, $udp_query_file);
         if (!$CheckLeak && defined $block->udp_listen) {
             my $reply = $block->udp_reply;
             if (!defined $reply) {
                 bail_out("$name - no --- udp_reply specified but --- udp_listen is specified");
+            }
+
+            if (defined $block->udp_query) {
+                $udp_query_file = tmpnam();
             }
 
             my $target = $block->udp_listen;
@@ -1642,12 +1760,6 @@ request:
 
             #warn "Reply: ", $reply;
 
-            if (defined $block->udp_query) {
-                my $tb = Test::More->builder;
-                $tb->use_numbers(0);
-                $tb->no_ending(1);
-            }
-
             my $pid = fork();
 
             if (!defined $pid) {
@@ -1655,6 +1767,10 @@ request:
 
             } elsif ($pid == 0) {
                 # child process
+
+                my $tb = Test::More->builder;
+                $tb->no_ending(1);
+
                 #my $rc = system($cmd);
 
                 $InSubprocess = 1;
@@ -1668,16 +1784,16 @@ request:
                 my $buf;
                 $udp_socket->recv($buf, 4096);
 
-                if (defined $block->udp_query) {
-                    if ($NoLongString) {
-                        Test::More::is($buf, $block->udp_query, "$name - udp_query ok");
-                    } else {
-                        is_string $buf, $block->udp_query, "$name - udp_query ok";
-                    }
-                }
+                if ($udp_query_file) {
+                    open my $out, ">$udp_query_file"
+                        or die "cannot open $udp_query_file for writing: $!\n";
 
-                if ($Verbose) {
-                    warn "udp server received $buf\n";
+                    if ($Verbose) {
+                        warn "writing received data [$buf] to file $udp_query_file\n";
+                    }
+
+                    print $out $buf;
+                    close $out;
                 }
 
                 my $delay = parse_time($block->udp_reply_delay);
@@ -1726,25 +1842,44 @@ request:
             write_user_files($block);
         }
 
-        if ($should_skip) {
+        if ($should_skip && defined $tests_to_skip) {
             SKIP: {
                 Test::More::skip("$name - $skip_reason", $tests_to_skip);
 
-                $RunTestHelper->($block, $dry_run);
+                $RunTestHelper->($block, $dry_run, $i - 1);
             }
 
         } elsif ($should_todo) {
             TODO: {
                 local $TODO = "$name - $todo_reason";
 
-                $RunTestHelper->($block, $dry_run);
+                $RunTestHelper->($block, $dry_run, $i - 1);
             }
 
         } else {
-            $RunTestHelper->($block, $dry_run);
+            $RunTestHelper->($block, $dry_run, $i - 1);
         }
 
         if (defined $udp_socket) {
+            my $buf = '';
+            if ($udp_query_file) {
+                if (!open my $in, $udp_query_file) {
+                    warn "WARNING: cannot open tcp query file $udp_query_file for reading: $!\n";
+
+                } else {
+                    $buf = do { local $/; <$in> };
+                    close $in;
+                }
+            }
+
+            if (defined $block->udp_query) {
+                if ($NoLongString) {
+                    Test::More::is($buf, $block->udp_query, "$name - udp_query ok");
+                } else {
+                    is_string $buf, $block->udp_query, "$name - udp_query ok";
+                }
+            }
+
             if (defined $UdpServerPid) {
                 kill_process($UdpServerPid, 1);
                 undef $UdpServerPid;
@@ -1760,6 +1895,29 @@ request:
         }
 
         if (defined $tcp_socket) {
+            my $buf = '';
+            if ($tcp_query_file) {
+                if (!open my $in, $tcp_query_file) {
+                    warn "WARNING: cannot open tcp query file $tcp_query_file for reading: $!\n";
+
+                } else {
+                    $buf = do { local $/; <$in> };
+                    close $in;
+                }
+            }
+
+            if (defined $block->tcp_query) {
+                if ($NoLongString) {
+                    Test::More::is($buf, $block->tcp_query, "$name - tcp_query ok");
+                } else {
+                    is_string $buf, $block->tcp_query, "$name - tcp_query ok";
+                }
+            }
+
+            if (defined $block->tcp_query_len) {
+                Test::More::is(length($buf), $block->tcp_query_len, "$name - TCP query length ok");
+            }
+
             if (defined $TcpServerPid) {
                 if ($Verbose) {
                     warn "killing TCP server, pid $TcpServerPid\n";
@@ -1802,7 +1960,9 @@ request:
             my $i = 0;
 retry:
             if (is_running($pid)) {
-                write_config_file($config, $block->http_config, $block->main_config);
+                write_config_file($config, $block->http_config,
+                                  $block->main_config,
+                                  $block->post_main_config);
 
                 if ($Verbose) {
                     warn "sending QUIT signal to $pid";
@@ -1868,9 +2028,13 @@ END {
                     #warn("Failed to send quit signal to the nginx process with PID $pid");
                 }
 
-                sleep $TestNginxSleep;
+                my $max_i = 15;
+                for (my $i = 1; $i <= $max_i; $i++) {
+                    last unless is_running($pid);
 
-                if (is_running($pid)) {
+                    sleep $TestNginxSleep;
+                    next if $i < $max_i;
+
                     warn "WARNING: killing nginx $pid with force...";
                     kill(SIGKILL, $pid);
                     waitpid($pid, 0);

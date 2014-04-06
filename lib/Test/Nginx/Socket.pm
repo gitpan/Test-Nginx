@@ -5,7 +5,7 @@ use lib 'inc';
 
 use Test::Base -Base;
 
-our $VERSION = '0.22';
+our $VERSION = '0.23';
 
 use POSIX qw( SIGQUIT SIGKILL SIGTERM SIGHUP );
 use Encode;
@@ -19,11 +19,14 @@ use File::Temp qw( tempfile );
 use POSIX ":sys_wait_h";
 
 use Test::Nginx::Util qw(
+  check_accum_error_log
   is_running
   $NoLongString
   no_long_string
   $ServerAddr
   server_addr
+  $ServerName
+  server_name
   parse_time
   $UseStap
   verbose
@@ -64,6 +67,7 @@ use Test::Nginx::Util qw(
   server_root
   html_dir
   server_port
+  server_port_for_client
   no_nginx_manager
 );
 
@@ -79,8 +83,9 @@ our @EXPORT = qw( plan run_tests run_test
   master_process_enabled
   no_long_string workers master_on master_off
   log_level no_shuffle no_root_location
-  server_addr server_root html_dir server_port
-  timeout no_nginx_manager
+  server_name
+  server_addr server_root html_dir server_port server_port_for_client
+  timeout no_nginx_manager check_accum_error_log
 );
 
 our $TotalConnectingTimeouts = 0;
@@ -96,7 +101,7 @@ sub read_event_handler ($);
 sub write_event_handler ($);
 sub check_response_body ($$$$$);
 sub fmt_str ($);
-sub gen_cmd_from_req ($);
+sub gen_cmd_from_req ($$);
 sub get_linear_regression_slope ($);
 sub value_contains ($$);
 
@@ -299,7 +304,7 @@ sub build_request_from_packets($$$$$) {
     $parsed_req->{method} .= ' ';
     $parsed_req->{url} .= ' ';
     $parsed_req->{http_ver} .= "\r\n";
-    $parsed_req->{headers} = "Host: localhost\r\nConnection: $conn_header\r\n$more_headers$len_header\r\n";
+    $parsed_req->{headers} = "Host: $ServerName\r\nConnection: $conn_header\r\n$more_headers$len_header\r\n";
 
     #  Get the moves from parsing
     my @elements_moves = get_moves($parsed_req);
@@ -452,7 +457,9 @@ sub get_req_from_block ($) {
 }
 
 sub run_test_helper ($$) {
-    my ( $block, $dry_run ) = @_;
+    my ($block, $dry_run, $repeated_req_idx) = @_;
+
+    #warn "repeated req idx: $repeated_req_idx";
 
     my $name = $block->name;
 
@@ -463,12 +470,14 @@ sub run_test_helper ($$) {
     }
 
     if ($CheckLeak) {
-        $dry_run = 1;
+        $dry_run = "the \"check leak\" testing mode";
+    }
 
+    if ($CheckLeak && !defined $block->no_check_leak) {
         warn "$name\n";
 
         my $req = $r_req_list->[0];
-        my $cmd = gen_cmd_from_req($req);
+        my $cmd = gen_cmd_from_req($block, $req);
 
         # start a sub-process to run ab or weighttp
         my $pid = fork();
@@ -587,7 +596,10 @@ sub run_test_helper ($$) {
         }
 
 again:
-        #warn "!!! resp: [$raw_resp]";
+
+        if ($Test::Nginx::Util::Verbose) {
+            warn "!!! resp: [$raw_resp]";
+        }
 
         if (!defined $raw_resp) {
             $raw_resp = '';
@@ -601,7 +613,13 @@ again:
                 warn "parse response\n";
             }
 
-            ( $res, $raw_headers, $left ) = parse_response( $name, $raw_resp, $head_req );
+            if (defined $block->http09) {
+                $res = HTTP::Response->new(200, "OK", [], $raw_resp);
+                $raw_headers = '';
+
+            } else {
+                ( $res, $raw_headers, $left ) = parse_response( $name, $raw_resp, $head_req );
+            }
         }
 
         if (!$n) {
@@ -625,7 +643,7 @@ again:
         }
 
         if ($n || $req_idx < @$r_req_list - 1) {
-            check_error_log($block, $res, $dry_run, $req_idx, $need_array);
+            check_error_log($block, $res, $dry_run, $repeated_req_idx, $need_array);
         }
 
         $req_idx++;
@@ -645,7 +663,7 @@ again:
 
     test_stap($block, $dry_run);
 
-    check_error_log($block, $res, $dry_run, $req_idx, $need_array);
+    check_error_log($block, $res, $dry_run, $repeated_req_idx, $need_array);
 }
 
 
@@ -758,7 +776,7 @@ sub check_error_code ($$$$$) {
 
     my $name = $block->name;
     SKIP: {
-        skip "$name - tests skipped due to the lack of directive $dry_run", 1 if $dry_run;
+        skip "$name - tests skipped due to $dry_run", 1 if $dry_run;
 
         if ( defined $block->error_code_like ) {
 
@@ -783,7 +801,7 @@ sub check_raw_response_headers($$$$$) {
     my $name = $block->name;
     if (defined $block->raw_response_headers_like) {
         SKIP: {
-            skip "$name - raw_response_headers_like - tests skipped due to the lack of directive $dry_run", 1 if $dry_run;
+            skip "$name - raw_response_headers_like - tests skipped due to $dry_run", 1 if $dry_run;
             my $expected = get_indexed_value($name,
                                              $block->raw_response_headers_like,
                                              $req_idx,
@@ -794,7 +812,7 @@ sub check_raw_response_headers($$$$$) {
 
     if (defined $block->raw_response_headers_unlike) {
         SKIP: {
-            skip "$name - raw_response_headers_unlike - tests skipped due to the lack of directive $dry_run", 1 if $dry_run;
+            skip "$name - raw_response_headers_unlike - tests skipped due to $dry_run", 1 if $dry_run;
             my $expected = get_indexed_value($name,
                                              $block->raw_response_headers_unlike,
                                              $req_idx,
@@ -817,12 +835,15 @@ sub check_response_headers($$$$$) {
 
                 #warn "HIT";
                 SKIP: {
-                    skip "$name - response_headers - tests skipped due to the lack of directive $dry_run", 1 if $dry_run;
+                    skip "$name - response_headers - tests skipped due to $dry_run", 1 if $dry_run;
                     unlike $raw_headers, qr/^\s*\Q$key\E\s*:/ms,
                       "$name - header $key not present in the raw headers";
                 }
                 next;
             }
+
+            $val =~ s/\$ServerPort\b/$ServerPort/g;
+            $val =~ s/\$ServerPortForClient\b/$ServerPortForClient/g;
 
             my $actual_val = $res ? $res->header($key) : undef;
             if ( !defined $actual_val ) {
@@ -830,7 +851,7 @@ sub check_response_headers($$$$$) {
             }
 
             SKIP: {
-                skip "$name - response_headers - tests skipped due to the lack of directive $dry_run", 1 if $dry_run;
+                skip "$name - response_headers - tests skipped due to $dry_run", 1 if $dry_run;
                 is $actual_val, $val, "$name - header $key ok";
             }
         }
@@ -846,7 +867,7 @@ sub check_response_headers($$$$$) {
                 $expected_val = '';
             }
             SKIP: {
-                skip "$name - response_headers_like - tests skipped due to the lack of directive $dry_run", 1 if $dry_run;
+                skip "$name - response_headers_like - tests skipped due to $dry_run", 1 if $dry_run;
                 like $expected_val, qr/^$val$/, "$name - header $key like ok";
             }
         }
@@ -871,13 +892,67 @@ sub value_contains ($$) {
     return undef;
 }
 
-sub check_error_log ($$$$$) {
-    my ($block, $res, $dry_run, $req_idx, $need_array) = @_;
+sub check_error_log ($$$$) {
+    my ($block, $res, $dry_run, $repeated_req_idx, $need_array) = @_;
     my $name = $block->name;
     my $lines;
 
     my $check_alert_message = 1;
     my $check_crit_message = 1;
+
+    my $grep_pat;
+    my $grep_pats = $block->grep_error_log;
+    if (defined $grep_pats) {
+        if (ref $grep_pats && ref $grep_pats eq 'ARRAY') {
+            $grep_pat = $grep_pats->[$repeated_req_idx];
+
+        } else {
+            $grep_pat = $grep_pats;
+        }
+    }
+
+    if (defined $grep_pat) {
+        my $expected = $block->grep_error_log_out;
+        if (!defined $expected) {
+            bail_out("$name - No --- grep_error_log_out defined but --- grep_error_log is defined");
+        }
+
+        #warn "ref grep error log: ", ref $expected;
+
+        if (ref $expected && ref $expected eq 'ARRAY') {
+            #warn "grep error log out is an ARRAY";
+            $expected = $expected->[$repeated_req_idx];
+        }
+
+        SKIP: {
+            skip "$name - error_log - tests skipped due to $dry_run", 1 if $dry_run;
+
+            $lines ||= error_log_data();
+
+            my $matched_lines = '';
+            for my $line (@$lines) {
+                if (ref $grep_pat && $line =~ /$grep_pat/ || $line =~ /\Q$grep_pat\E/) {
+                    my $matched = $&;
+                    if ($matched !~ /\n/) {
+                        $matched_lines .= $matched . "\n";
+                    }
+                }
+            }
+
+            if (ref $expected eq 'Regexp') {
+                like($matched_lines, $expected, "$name - grep_error_log_out (req $repeated_req_idx)");
+
+            } else {
+                if ($NoLongString) {
+                    is($matched_lines, $expected,
+                       "$name - grep_error_log_out (req $repeated_req_idx)" );
+                } else {
+                    is_string($matched_lines, $expected,
+                              "$name - grep_error_log_out (req $repeated_req_idx)");
+                }
+            }
+        }
+    }
 
     if (defined $block->error_log) {
         my $pats = $block->error_log;
@@ -903,14 +978,14 @@ sub check_error_log ($$$$$) {
             $pats = \@clone;
         }
 
-        $lines = error_log_data();
+        $lines ||= error_log_data();
         for my $line (@$lines) {
             for my $pat (@$pats) {
                 next if !defined $pat;
                 if (ref $pat && $line =~ /$pat/ || $line =~ /\Q$pat\E/) {
                     SKIP: {
-                        skip "$name - error_log - tests skipped due to the lack of directive $dry_run", 1 if $dry_run;
-                        pass("$name - pattern \"$pat\" matches a line in error.log");
+                        skip "$name - error_log - tests skipped due to $dry_run", 1 if $dry_run;
+                        pass("$name - pattern \"$pat\" matches a line in error.log (req $repeated_req_idx)");
                     }
                     undef $pat;
                 }
@@ -920,8 +995,8 @@ sub check_error_log ($$$$$) {
         for my $pat (@$pats) {
             if (defined $pat) {
                 SKIP: {
-                    skip "$name - error_log - tests skipped due to the lack of directive $dry_run", 1 if $dry_run;
-                    fail("$name - pattern \"$pat\" matches a line in error.log");
+                    skip "$name - error_log - tests skipped due to $dry_run", 1 if $dry_run;
+                    fail("$name - pattern \"$pat\" matches a line in error.log (req $repeated_req_idx)");
                     #die join("", @$lines);
                 }
             }
@@ -945,6 +1020,9 @@ sub check_error_log ($$$$$) {
             my @lines = split /\n+/, $pats;
             $pats = \@lines;
 
+        } elsif (ref $pats eq 'Regexp') {
+            $pats = [$pats];
+
         } else {
             my @clone = @$pats;
             $pats = \@clone;
@@ -957,10 +1035,10 @@ sub check_error_log ($$$$$) {
                 #warn "test $pat\n";
                 if ((ref $pat && $line =~ /$pat/) || $line =~ /\Q$pat\E/) {
                     SKIP: {
-                        skip "$name - no_error_log - tests skipped due to the lack of directive $dry_run", 1 if $dry_run;
+                        skip "$name - no_error_log - tests skipped due to $dry_run", 1 if $dry_run;
                         my $ln = fmt_str($line);
                         my $p = fmt_str($pat);
-                        fail("$name - pattern \"$p\" should not match any line in error.log but matches line \"$ln\"");
+                        fail("$name - pattern \"$p\" should not match any line in error.log but matches line \"$ln\" (req $repeated_req_idx)");
                     }
                     undef $pat;
                 }
@@ -970,9 +1048,9 @@ sub check_error_log ($$$$$) {
         for my $pat (@$pats) {
             if (defined $pat) {
                 SKIP: {
-                    skip "$name - no_error_log - tests skipped due to the lack of directive $dry_run", 1 if $dry_run;
+                    skip "$name - no_error_log - tests skipped due to $dry_run", 1 if $dry_run;
                     my $p = fmt_str($pat);
-                    pass("$name - pattern \"$p\" does not match a line in error.log");
+                    pass("$name - pattern \"$p\" does not match a line in error.log (req $repeated_req_idx)");
                 }
             }
         }
@@ -997,6 +1075,17 @@ sub check_error_log ($$$$$) {
                 my $ln = fmt_str($line);
                 warn("WARNING: $name - $ln");
             }
+        }
+    }
+
+    for my $line (@$lines) {
+        #warn "test $pat\n";
+        if ($line =~ /\bAssertion .*? failed\.$/) {
+            my $tb = Test::More->builder;
+            $tb->no_ending(1);
+
+            chomp $line;
+            fail("$name - $line");
         }
     }
 }
@@ -1053,7 +1142,7 @@ sub check_response_body ($$$$$) {
 
         #warn "no long string: $NoLongString";
         SKIP: {
-            skip "$name - response_body - tests skipped due to the lack of directive $dry_run", 1 if $dry_run;
+            skip "$name - response_body - tests skipped due to $dry_run", 1 if $dry_run;
             if (ref $expected) {
                 like $content, $expected, "$name - response_body - like";
 
@@ -1069,15 +1158,30 @@ sub check_response_body ($$$$$) {
             }
         }
 
-    }
-    elsif ( defined $block->response_body_like ) {
+    } elsif (defined $block->response_body_like
+             || defined $block->response_body_unlike)
+    {
+        my $patterns;
+        my $type;
+        my $cmp;
+        if (defined $block->response_body_like) {
+            $patterns = $block->response_body_like;
+            $type = "like";
+            $cmp = \&like;
+
+        } else {
+            $patterns = $block->response_body_unlike;
+            $type = "unlike";
+            $cmp = \&unlike;
+        }
+
         my $content = $res ? $res->content : undef;
         if ( defined $content ) {
             $content =~ s/^TE: deflate,gzip;q=0\.3\r\n//gms;
             $content =~ s/^Connection: TE, close\r\n//gms;
         }
         my $expected_pat = get_indexed_value($name,
-                                             $block->response_body_like,
+                                             $patterns,
                                              $req_idx,
                                              $need_array);
         $expected_pat =~ s/\$ServerPort\b/$ServerPort/g;
@@ -1088,9 +1192,9 @@ sub check_response_body ($$$$$) {
         }
 
         SKIP: {
-            skip "$name - response_body_like - tests skipped due to the lack of directive $dry_run", 1 if $dry_run;
-            like( $content, qr/$expected_pat/s,
-                "$name - response_body_like - response is expected ($summary)"
+            skip "$name - response_body_$type - tests skipped due to $dry_run", 1 if $dry_run;
+            $cmp->( $content, qr/$expected_pat/s,
+                "$name - response_body_$type - response is expected ($summary)"
             );
         }
     }
@@ -1111,9 +1215,15 @@ sub parse_response($$$) {
     #warn "raw headers: $raw_headers\n";
 
     my $res = HTTP::Response->parse($raw_resp);
-    my $enc = $res->header('Transfer-Encoding');
 
+    my $code = $res->code;
+
+    my $enc = $res->header('Transfer-Encoding');
     my $len = $res->header('Content-Length');
+
+    if ($code && ($code == 304 || $code == 101)) {
+        return $res, $raw_headers
+    }
 
     if ( defined $enc && $enc eq 'chunked' ) {
 
@@ -1238,6 +1348,7 @@ sub send_request ($$$$@) {
                 my $errcode = $!;
                 if (waitpid($Test::Nginx::Util::ChildPid, WNOHANG) == -1) {
                     warn "WARNING: Child process $Test::Nginx::Util::ChildPid is already gone.\n";
+                    warn `tail -n20 $Test::Nginx::Util::ErrLogFile`;
 
                     my $tb = Test::More->builder;
                     $tb->no_ending(1);
@@ -1557,7 +1668,7 @@ sub read_event_handler ($) {
                 #sleep 0.002;
                 return 1;
             }
-            $ctx->{resp} = "500 read failed: $!";
+            warn "WARNING: $ctx->{name} - HTTP response read failure: $!";
             return undef;
         }
 
@@ -1574,8 +1685,10 @@ sub read_event_handler ($) {
     return undef;
 }
 
-sub gen_cmd_from_req ($) {
-    my $req = shift;
+sub gen_cmd_from_req ($$) {
+    my ($block, $req) = @_;
+
+    my $name = $block->name;
 
     $req = join '', map { $_->{value} } @$req;
 
@@ -1585,8 +1698,12 @@ sub gen_cmd_from_req ($) {
     if ($req =~ m{^\s*(\w+)\s+(.*\S)\s*HTTP/(\S+)\r\n}gcs) {
         ($meth, $uri, $http_ver) = ($1, $2, $3);
 
+    } elsif ($req =~ m{^\s*(\w+)\s+(.*\S)\r\n}gcs) {
+        ($meth, $uri) = ($1, $2);
+        $http_ver = '0.9';
+
     } else {
-        bail_out "cannot parse the status line in the request: $req";
+        bail_out "$name - cannot parse the status line in the request: $req";
     }
 
     #warn "HTTP version: $http_ver\n";
@@ -1594,26 +1711,29 @@ sub gen_cmd_from_req ($) {
     my @opts = ('-c2', '-k', '-n100000');
 
     my $prog;
-    if ($http_ver eq '1.1' and $meth eq 'GET') {
+    if ($http_ver eq '1.1' && $meth eq 'GET') {
         $prog = 'weighttp';
 
     } else {
-        # HTTP 1.0
+        # HTTP 1.0 or HTTP 0.9
         $prog = 'ab';
         unshift @opts, '-r', '-d', '-S';
     }
 
     my @headers;
-    if ($req =~ m{\G(.*?)\r\n\r\n}gcs) {
-        my $headers = $1;
-        #warn "raw headers: $headers\n";
-        @headers = grep {
-            !/^Connection\s*:/i && !/^Host: localhost$/i
+    if ($http_ver ge '1.0') {
+        if ($req =~ m{\G(.*?)\r\n\r\n}gcs) {
+            my $headers = $1;
+            #warn "raw headers: $headers\n";
+            @headers = grep {
+                !/^Connection\s*:/i
+                && !/^Host: \Q$ServerName\E$/i
                 && !/^Content-Length\s*:/i
-        } split /\r\n/, $headers;
+            } split /\r\n/, $headers;
 
-    } else {
-        bail_out "cannot parse the header entries in the request: $req";
+        } else {
+            bail_out "cannot parse the header entries in the request: $req";
+        }
     }
 
     #warn "headers: @headers ", scalar(@headers), "\n";
@@ -1707,8 +1827,10 @@ Test::Nginx::Socket - Socket-backed test scaffold for the Nginx C modules
 
     use Test::Nginx::Socket;
 
-    plan tests => $Test::Nginx::Socket::RepeatEach * 2 * blocks();
+    repeat_each(2);
+    plan tests => repeat_each() * 3 * blocks();
 
+    no_shuffle();
     run_tests();
 
     __DATA__
@@ -1790,6 +1912,77 @@ This module will create a temporary server root under t/servroot/ of the current
 You will often want to look into F<t/servroot/logs/error.log>
 when things go wrong ;)
 
+=head1 Exported Perl Functions
+
+The following Perl functions are exported by default:
+
+=head2 run_tests
+
+This is the main entry point of the test scaffold. Calling this Perl function before C<__DATA__> makes all the tests run.
+Other configuration Perl functions I<must> be called before calling this C<run_tests> function.
+
+=head2 no_shuffle
+
+By default, the test scaffold always shuffles the order of the test blocks automatically. Calling this function before
+calling C<run_tests> will disable the suffling.
+
+=head2 no_long_string
+
+By default, failed string equality test will use the L<Test::LongString> module to generate the error message. Calling this function
+before calling C<run_tests> will turn this off.
+
+=head2 no_diff
+
+When the C<no_long_string> function is called, the C<Text::Diff> module will be used to generate a diff for failed string equality test. Calling this C<no_diff> function before calling C<run_tests> will turn this diff output format off and just generate the raw "got" text and "expected" text.
+
+=head2 worker_connections
+
+Call this function before calling C<run_tests> to set the Nginx's C<worker_connections> configuration value. For example,
+
+    worker_connections(1024);
+    run_tests();
+
+Default to 64.
+
+=head2 repeat_each
+
+Call this function with an integer argument before C<run_tests()> to ask the test scaffold
+to run the specified number of duplicate requests for each test block. When it is called without argument, it returns the current setting.
+
+Default to 1.
+
+=head2 workers
+
+Call this function before C<run_tests()> to configure Nginx's C<worker_processes> directive's value. For example,
+
+    workers(2);
+
+Default to 1.
+
+=head2 master_on
+
+Call this function before C<run_tests()> to turn on the Nginx master process.
+
+By default, the master process is not enabled unless in the "HUP reload" testing mode.
+
+=head2 log_level
+
+Call this function before C<run_tests()> to set the default error log filtering level in Nginx.
+
+This global setting can be overridden by the per-test-block C<--- log_level> sections.
+
+Default to C<debug>.
+
+=head2 check_accum_error_log
+
+Make C<--- error_log> and C<--- no_error_log> check accumulated error log across duplicate requests controlled by C<repeat_each>. By default, only the error logs belonging to the individual C<repeat_each> request is tested.
+
+=head2 no_root_location
+
+By default, the Nginx configuration file generated by the test scaffold
+automatically emits a C<location />. Calling this function before C<run_tests()>
+disables this behavior such that the test blocks can have their own root locations.
+
 =head1 Sections supported
 
 The following sections are supported:
@@ -1838,12 +2031,17 @@ variable expansion (variables have to start with TEST_NGINX).
 
 =head2 main_config
 
-Content of this section will be included in the "main" part of the generated
+Content of this section will be included in the "main" part (or toplevel) of the generated
 config file. This is very rarely used, except if you are testing nginx core
-itself.
+itself. Everything in C<--- main_config> will be put before the C<http {}> block generated automatically by the test scaffold.
 
 This section goes through environment
 variable expansion (variables have to start with TEST_NGINX).
+
+=head2 post_main_config
+
+Similar to C<main_config>, but the content will be put I<after> the C<http {}>
+block generated by this module.
 
 =head2 request
 
@@ -2031,6 +2229,11 @@ section. Example:
 If the test is made of multiple requests, then response_body_like B<MUST>
 be an array and each request B<MUST> match the corresponding pattern.
 
+=head2 response_body_unlike
+
+Just like C<response_body_like> but this test only pass when the specified pattern
+does I<not> match the actual response body data.
+
 =head2 response_headers
 
 The headers specified in this section are in the response sent by nginx.
@@ -2176,6 +2379,8 @@ Multiple patterns are also supported, for example:
 then the substring "abc" must appear literally in a line of F<error.log>, and the regex C<qr/blah>
 must also match a line in F<error.log>.
 
+By default, only the part of the error logs corresponding to the current request is checked. You can make it check accumulated error logs by calling the C<check_accum_error_log> Perl function before calling C<run_tests> in the boilerplate Perl code above the C<__DATA__> line.
+
 =head2 abort
 
 Makes the test scaffold not to treat C<--- timeout> expiration as a test failure.
@@ -2209,6 +2414,31 @@ Just like the C<--- error_log> section, one can also specify multiple patterns:
 
 Then if any line in F<error.log> contains the string C<"abc"> or match the Perl regex C<qr/blah/>, then the test will fail.
 
+=head2 grep_error_log
+
+This section specifies the Perl regex pattern for filtering out the Nginx error logs.
+
+You can specify a verbatim substring being matched in the error log messages, as in
+
+    --- grep_error_log chop
+    some thing we want to see
+
+or specify a Perl regex object to match against the error log message lines, as in
+
+    --- grep_error_log eval
+    qr/something should be: \d+/
+
+All the matched substrings in the error log messages will be concatenated by a newline character as a whole to be compared with the value of the C<--- grep_error_log_out> section.
+
+=head2 grep_error_log_out
+
+This section contains the expected output for the filtering operations specified by the C<--- grep_error_log> section.
+
+If the filtered output varies among the repeated requests (specified by the C<repeat_each> function, then you can specify a Perl array as the value, as in
+
+    --- grep_error_log_out eval
+    ["output for req 0", "output for req 1"]
+
 =head2 log_level
 
 Overrides the default error log level for the current test block.
@@ -2217,7 +2447,7 @@ For example:
 
     --- log_level: debug
 
-The default error log level can be specified in the Perl code by calling the `log_level()` function, as in
+The default error log level can be specified in the Perl code by calling the C<log_level()> function, as in
 
     use Test::Nginx::Socket;
 
@@ -2249,6 +2479,27 @@ This can also be useful to tests "invalid" request lines:
 
     --- raw_request
     GET /foo HTTP/2.0 THE_FUTURE_IS_NOW
+
+=head2 http09
+
+Specifies that the HTTP 0.9 protocol is used. This affects how C<Test::Nginx::Socket>
+parses the response.
+
+Below is an example from ngx_headers_more module's test suite:
+
+    === TEST 38: HTTP 0.9 (set)
+    --- config
+        location /foo {
+            more_set_input_headers 'X-Foo: howdy';
+            echo "x-foo: $http_x_foo";
+        }
+    --- raw_request eval
+    "GET /foo\r\n"
+    --- response_headers
+    ! X-Foo
+    --- response_body
+    x-foo: 
+    --- http09
 
 =head2 ignore_response
 
@@ -2523,7 +2774,13 @@ For example,
 
 =head2 tcp_listen
 
-Just like C<udp_listen>, but starts an embedded TCP server listening on the port specified.
+Just like C<udp_listen>, but starts an embedded TCP server listening on the port specified. For example,
+
+    --- tcp_listen: 12345
+
+Stream-typed unix domain socket is also supported. Just specify the path to the socket file, as in
+
+    --- tcp_listen: /tmp/my-socket.sock
 
 =head2 tcp_no_close
 
@@ -2550,6 +2807,11 @@ Specifies the expected TCP query received by the embedded TCP server.
 
 Delay in sec between sending successive packets in the "raw_request" array
 value. Also used when a request is split in packets.
+
+=head2 no_check_leak
+
+Skip the tests in the current test block in the "check leak" testing mode
+(i.e, with C<TEST_NGINX_CHECK_LEAK>=1).
 
 =head1 Environment variables
 
@@ -2617,6 +2879,8 @@ Other methods specified in the test cases will turn to C<GET> with force.
 
 The tests in this mode will always succeed because this mode also
 enforces the "dry-run" mode.
+
+Test blocks carrying the "--- no_check_leak" directive will be skipped in this testing mode.
 
 =head2 TEST_NGINX_USE_HUP
 
@@ -2842,13 +3106,13 @@ in his Debian repository: http://debian.perusio.net
 
 =head1 AUTHORS
 
-Yichun "agentzh" Zhang (章亦春) C<< <agentzh@gmail.com> >>
+Yichun "agentzh" Zhang (章亦春) C<< <agentzh@gmail.com> >>, CloudFlare Inc.
 
 Antoine BONAVITA C<< <antoine.bonavita@gmail.com> >>
 
 =head1 COPYRIGHT & LICENSE
 
-Copyright (c) 2009-2012, agentzh C<< <agentzh@gmail.com> >>.
+Copyright (c) 2009-2014, Yichun Zhang C<< <agentzh@gmail.com> >>, CloudFlare Inc.
 
 Copyright (c) 2011-2012, Antoine BONAVITA C<< <antoine.bonavita@gmail.com> >>.
 
