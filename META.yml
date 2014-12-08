@@ -1,7 +1,7 @@
 ---
-abstract: 'Testing modules for Nginx C module development'
+abstract: 'Data-driven test scaffold for Nginx C module and OpenResty Lua library development'
 author:
-  - 'agentzh (章亦春) C<< <agentzh@gmail.com> >>'
+  - 'Yichun Zhang (agentzh) C<< <agentzh@gmail.com> >>'
 build_requires:
   ExtUtils::MakeMaker: 6.59
 configure_requires:
@@ -43,4 +43,4 @@ requires:
 resources:
   license: http://opensource.org/licenses/bsd-license.php
   repository: http://github.com/agentzh/test-nginx
-version: 0.23
+version: 0.24

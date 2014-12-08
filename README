@@ -1,5 +1,6 @@
 NAME
-    Test::Nginx - Testing modules for Nginx C module development
+    Test::Nginx - Data-driven test scaffold for Nginx C module and OpenResty
+    Lua library development
 
 DESCRIPTION
     This distribution provides two testing modules for Nginx C module
@@ -131,7 +132,7 @@ DESCRIPTION
   valgrind integration
     Test::Nginx has integrated support for valgrind (<http://valgrind.org>)
     even though by default it does not bother running it with the tests
-    because valgrind will significantly slow down the test sutie.
+    because valgrind will significantly slow down the test suite.
 
     First ensure that your valgrind executable visible in your PATH env. And
     then run your test suite with the "TEST_NGINX_USE_VALGRIND" env set to
@@ -237,15 +238,24 @@ SOURCE REPOSITORY
 
 DEBIAN PACKAGES
     António P. P. Almeida is maintaining a Debian package for this module in
-    his Debian repository: http://debian.perusio.net
+    his Debian repository: <http://debian.perusio.net>
+
+Community
+  English Mailing List
+    The "openresty-en" mailing list is for English speakers:
+    <https://groups.google.com/group/openresty-en>
+
+  Chinese Mailing List
+    The "openresty" mailing list is for Chinese speakers:
+    <https://groups.google.com/group/openresty>
 
 AUTHORS
-    agentzh (章亦春) "<agentzh@gmail.com>"
+    Yichun Zhang (agentzh) "<agentzh@gmail.com>"
 
     Antoine BONAVITA "<antoine.bonavita@gmail.com>"
 
 COPYRIGHT & LICENSE
-    Copyright (c) 2009-2012, agentzh "<agentzh@gmail.com>".
+    Copyright (c) 2009-2014, Yichun Zhang (agentzh) "<agentzh@gmail.com>".
 
     Copyright (c) 2011-2012, Antoine Bonavita
     "<antoine.bonavita@gmail.com>".

@@ -3,7 +3,7 @@ package Test::Nginx;
 use strict;
 use warnings;
 
-our $VERSION = '0.23';
+our $VERSION = '0.24';
 
 __END__
 
@@ -11,7 +11,7 @@ __END__
 
 =head1 NAME
 
-Test::Nginx - Testing modules for Nginx C module development
+Test::Nginx - Data-driven test scaffold for Nginx C module and OpenResty Lua library development
 
 =head1 DESCRIPTION
 
@@ -153,7 +153,7 @@ stdout/stderr.
 
 Test::Nginx has integrated support for valgrind (L<http://valgrind.org>) even though by
 default it does not bother running it with the tests because valgrind
-will significantly slow down the test sutie.
+will significantly slow down the test suite.
 
 First ensure that your valgrind executable visible in your PATH env.
 And then run your test suite with the C<TEST_NGINX_USE_VALGRIND> env set
@@ -285,17 +285,27 @@ If you want a commit bit, feel free to drop me a line.
 =head1 DEBIAN PACKAGES
 
 António P. P. Almeida is maintaining a Debian package for this module
-in his Debian repository: http://debian.perusio.net
+in his Debian repository: L<http://debian.perusio.net>
+
+=head1 Community
+
+=head2 English Mailing List
+
+The C<openresty-en> mailing list is for English speakers: L<https://groups.google.com/group/openresty-en>
+
+=head2 Chinese Mailing List
+
+The C<openresty> mailing list is for Chinese speakers: L<https://groups.google.com/group/openresty>
 
 =head1 AUTHORS
 
-agentzh (章亦春) C<< <agentzh@gmail.com> >>
+Yichun Zhang (agentzh) C<< <agentzh@gmail.com> >>
 
 Antoine BONAVITA C<< <antoine.bonavita@gmail.com> >>
 
 =head1 COPYRIGHT & LICENSE
 
-Copyright (c) 2009-2012, agentzh C<< <agentzh@gmail.com> >>.
+Copyright (c) 2009-2014, Yichun Zhang (agentzh) C<< <agentzh@gmail.com> >>.
 
 Copyright (c) 2011-2012, Antoine Bonavita C<< <antoine.bonavita@gmail.com> >>.
 

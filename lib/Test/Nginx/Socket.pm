@@ -5,7 +5,7 @@ use lib 'inc';
 
 use Test::Base -Base;
 
-our $VERSION = '0.23';
+our $VERSION = '0.24';
 
 use POSIX qw( SIGQUIT SIGKILL SIGTERM SIGHUP );
 use Encode;
@@ -18,58 +18,7 @@ use IO::Select ();
 use File::Temp qw( tempfile );
 use POSIX ":sys_wait_h";
 
-use Test::Nginx::Util qw(
-  check_accum_error_log
-  is_running
-  $NoLongString
-  no_long_string
-  $ServerAddr
-  server_addr
-  $ServerName
-  server_name
-  parse_time
-  $UseStap
-  verbose
-  sleep_time
-  stap_out_fh
-  stap_out_fname
-  setup_server_root
-  write_config_file
-  get_canon_version
-  get_nginx_version
-  bail_out
-  trim
-  show_all_chars
-  get_pid_from_pidfile
-  parse_headers
-  run_tests
-  $ServerPortForClient
-  $ServerPort
-  $PidFile
-  $ServRoot
-  $ConfFile
-  $RunTestHelper
-  $FilterHttpConfig
-  $RepeatEach
-  $CheckLeak
-  timeout
-  error_log_data
-  worker_connections
-  master_process_enabled
-  config_preamble
-  repeat_each
-  workers
-  master_on
-  master_off
-  log_level
-  no_shuffle
-  no_root_location
-  server_root
-  html_dir
-  server_port
-  server_port_for_client
-  no_nginx_manager
-);
+use Test::Nginx::Util;
 
 #use Smart::Comments::JSON '###';
 use Fcntl qw(F_GETFL F_SETFL O_NONBLOCK);
@@ -78,7 +27,7 @@ use IO::Socket;
 
 #our ($PrevRequest, $PrevConfig);
 
-our @EXPORT = qw( plan run_tests run_test
+our @EXPORT = qw( is_str plan run_tests run_test
   repeat_each config_preamble worker_connections
   master_process_enabled
   no_long_string workers master_on master_off
@@ -86,6 +35,8 @@ our @EXPORT = qw( plan run_tests run_test
   server_name
   server_addr server_root html_dir server_port server_port_for_client
   timeout no_nginx_manager check_accum_error_log
+  add_block_preprocessor bail_out add_cleanup_handler
+  add_response_body_check
 );
 
 our $TotalConnectingTimeouts = 0;
@@ -99,16 +50,24 @@ sub test_stap ($$);
 sub error_event_handler ($);
 sub read_event_handler ($);
 sub write_event_handler ($);
-sub check_response_body ($$$$$);
+sub check_response_body ($$$$$$);
 sub fmt_str ($);
-sub gen_cmd_from_req ($$);
+sub gen_ab_cmd_from_req ($$@);
+sub gen_curl_cmd_from_req ($$);
 sub get_linear_regression_slope ($);
 sub value_contains ($$);
 
 $RunTestHelper = \&run_test_helper;
+$CheckErrorLog = \&check_error_log;
 
 sub set_http_config_filter ($) {
     $FilterHttpConfig = shift;
+}
+
+our @ResponseBodyChecks;
+
+sub add_response_body_check ($) {
+    push @ResponseBodyChecks, shift;
 }
 
 #  This will parse a "request"" string. The expected format is:
@@ -133,7 +92,7 @@ sub parse_request ($$) {
     my ($rel_url, $rel_url_size, $after_rel_url);
     my ($http_ver, $http_ver_size, $after_http_ver);
     my $end_line_size;
-    if ($first =~ /^(\s*)(\S+)( *)((\S+)( *))?((\S+)( *))?(\s*)/) {
+    if ($first =~ /^(\s*)(\S+)( *)((\S+)( *))?((\S+)( *))?(\s*)$/) {
         $before_meth = defined $1 ? length($1) : undef;
         $meth = $2;
         $after_meth = defined $3 ? length($3) : undef;
@@ -153,7 +112,7 @@ sub parse_request ($$) {
         }
         $end_line_size = defined $10 ? length($10) : undef;
     } else {
-        bail_out("$name - Request line is not valid. Should be 'meth [url [version]]'");
+        bail_out("$name - Request line is not valid. Should be 'meth [url [version]]' but got \"$first\".");
     }
     if ( !defined $rel_url ) {
         $rel_url = '/';
@@ -294,22 +253,55 @@ sub build_request_from_packets($$$$$) {
     if (   !$is_chunked
         && defined $parsed_req->{content}
         && $parsed_req->{content} ne ''
-        && $more_headers !~ /\bContent-Length:/ )
+        && $more_headers !~ /(?:^|\n)Content-Length:/ )
     {
         $parsed_req->{content} =~ s/^\s+|\s+$//gs;
 
         $len_header .=
           "Content-Length: " . length( $parsed_req->{content} ) . "\r\n";
     }
+
+    $more_headers =~ s/(?<!\r)\n/\r\n/gs;
+
+    my $headers = '';
+
+    if ($more_headers !~ /(?:^|\n)Host:/msi) {
+        $headers .= "Host: $ServerName\r\n";
+    }
+
+    if ($more_headers !~ /(?:^|\n)Connection/msi) {
+        $headers .= "Connection: $conn_header\r\n";
+    }
+
+    $headers .= "$more_headers$len_header\r\n";
+
     $parsed_req->{method} .= ' ';
     $parsed_req->{url} .= ' ';
     $parsed_req->{http_ver} .= "\r\n";
-    $parsed_req->{headers} = "Host: $ServerName\r\nConnection: $conn_header\r\n$more_headers$len_header\r\n";
+    $parsed_req->{headers} = $headers;
 
     #  Get the moves from parsing
     my @elements_moves = get_moves($parsed_req);
     # Apply them to the packets.
     return apply_moves($request_packets, \@elements_moves);
+}
+
+sub parse_more_headers ($) {
+    my ($in) = @_;
+    my @headers = split /\n+/, $in;
+    my $is_chunked;
+    my $out = '';
+    for my $header (@headers) {
+        next if $header =~ /^\s*\#/;
+        my ($key, $val) = split /:\s*/, $header, 2;
+        if (lc($key) eq 'transfer-encoding' and $val eq 'chunked') {
+            $is_chunked = 1;
+        }
+
+        #warn "[$key, $val]\n";
+        $out .= "$key: $val\r\n";
+    }
+    return $out, $is_chunked;
 }
 
 #  Returns an array of array of hashes from the block. Each element of
@@ -324,57 +316,49 @@ sub get_req_from_block ($) {
 
     my @req_list = ();
 
-    if ( defined $block->raw_request ) {
+    if (defined $block->raw_request) {
 
         # Should be deprecated.
-        if ( ref $block->raw_request && ref $block->raw_request eq 'ARRAY' ) {
+        if (ref $block->raw_request && ref $block->raw_request eq 'ARRAY') {
 
             #  User already provided an array. So, he/she specified where the
             # data should be split. This allows for backward compatibility but
             # should use request with arrays as it provides the same functionnality.
             my @rr_list = ();
-            for my $elt ( @{ $block->raw_request } ) {
+            for my $elt (@{ $block->raw_request }) {
                 push @rr_list, {value => $elt};
             }
             push @req_list, \@rr_list;
-        }
-        else {
+
+        } else {
             push @req_list, [{value => $block->raw_request}];
         }
-    }
-    else {
+
+    } else {
         my $request;
-        if ( defined $block->request_eval ) {
+        if (defined $block->request_eval) {
 
             diag "$name - request_eval DEPRECATED. Use request eval instead.";
             $request = eval $block->request_eval;
             if ($@) {
                 warn $@;
             }
-        }
-        else {
+
+        } else {
             $request = $block->request;
-        }
-
-        my $is_chunked   = 0;
-        my $more_headers = '';
-        if ( $block->more_headers ) {
-            my @headers = split /\n+/, $block->more_headers;
-            for my $header (@headers) {
-                next if $header =~ /^\s*\#/;
-                my ( $key, $val ) = split /:\s*/, $header, 2;
-                if ( lc($key) eq 'transfer-encoding' and $val eq 'chunked' ) {
-                    $is_chunked = 1;
+            if (defined $request) {
+                while ($request =~ s/^\s*\#[^\n]+\s+|^\s+//gs) {
+                   # do nothing
                 }
-
-                #warn "[$key, $val]\n";
-                $more_headers .= "$key: $val\r\n";
             }
+            #warn "my req: $request";
         }
+
+        my $more_headers = $block->more_headers || '';
 
         if ( $block->pipelined_requests ) {
             my $reqs = $block->pipelined_requests;
-            if ( !ref $reqs || ref $reqs ne 'ARRAY' ) {
+            if (!ref $reqs || ref $reqs ne 'ARRAY') {
                 bail_out(
                     "$name - invalid entries in --- pipelined_requests");
             }
@@ -382,25 +366,49 @@ sub get_req_from_block ($) {
             my $prq = "";
             for my $request (@$reqs) {
                 my $conn_type;
-                if ( $i++ == @$reqs - 1 ) {
+                if ($i == @$reqs - 1) {
                     $conn_type = 'close';
-                }
-                else {
+
+                } else {
                     $conn_type = 'keep-alive';
                 }
-                my $r_br = build_request_from_packets($name, $more_headers,
+
+                my ($hdr, $is_chunked);
+                if (ref $more_headers eq 'ARRAY') {
+                    #warn "Found ", scalar @$more_headers, " entries in --- more_headers.";
+                    $hdr = $more_headers->[$i];
+                    if (!defined $hdr) {
+                        bail_out("--- more_headers lacks data for the $i pipelined request");
+                    }
+                    ($hdr, $is_chunked) = parse_more_headers($hdr);
+                    #warn "more headers: $hdr";
+
+                } else {
+                    ($hdr, $is_chunked)  = parse_more_headers($more_headers);
+                }
+
+                my $r_br = build_request_from_packets($name, $hdr,
                                       $is_chunked, $conn_type,
                                       [$request] );
                 $prq .= $$r_br[0];
+                $i++;
             }
             push @req_list, [{value =>$prq}];
-        }
-        else {
+
+        } else {
+            my $is_chunked;
+            if ($more_headers) {
+                ($more_headers, $is_chunked) = parse_more_headers($more_headers);
+
+            } else {
+                $more_headers = '';
+            }
+
             # request section.
             if (!ref $request) {
                 # One request and it is a good old string.
                 my $r_br = build_request_from_packets($name, $more_headers,
-                                                      $is_chunked, 'Close',
+                                                      $is_chunked, 'close',
                                                       [$request] );
                 push @req_list, [{value => $$r_br[0]}];
             } elsif (ref $request eq 'ARRAY') {
@@ -409,7 +417,7 @@ sub get_req_from_block ($) {
                     if (!ref $one_req) {
                         # This request is a good old string.
                         my $r_br = build_request_from_packets($name, $more_headers,
-                                                      $is_chunked, 'Close',
+                                                      $is_chunked, 'close',
                                                       [$one_req] );
                         push @req_list, [{value => $$r_br[0]}];
                     } elsif (ref $one_req eq 'ARRAY') {
@@ -427,7 +435,7 @@ sub get_req_from_block ($) {
                             }
                         }
                         my $transformed_packet_array = build_request_from_packets($name, $more_headers,
-                                                   $is_chunked, 'Close',
+                                                   $is_chunked, 'close',
                                                    \@packet_array);
                         my @transformed_req = ();
                         my $idx = 0;
@@ -456,6 +464,25 @@ sub get_req_from_block ($) {
     return \@req_list;
 }
 
+sub quote_sh_args ($) {
+    my ($args) = @_;
+    for my $arg (@$args) {
+       if ($arg =~ m{^[- "&%;,|?*.+=\w:/()]*$}) {
+          if ($arg =~ /[ "&%;,|?*()]/) {
+             $arg = "'$arg'";
+          }
+          next;
+       }
+       $arg =~ s/\\/\\\\/g;
+       $arg =~ s/'/\\'/g;
+       $arg =~ s/\n/\\n/g;
+       $arg =~ s/\r/\\r/g;
+       $arg =~ s/\t/\\t/g;
+       $arg = "\$'$arg'";
+    }
+    return "@$args";
+}
+
 sub run_test_helper ($$) {
     my ($block, $dry_run, $repeated_req_idx) = @_;
 
@@ -469,15 +496,47 @@ sub run_test_helper ($$) {
         bail_out("$name - request empty");
     }
 
+    if (defined $block->curl) {
+        my $req = $r_req_list->[0];
+        my $cmd = gen_curl_cmd_from_req($block, $req);
+        warn "# ", quote_sh_args($cmd), "\n";
+    }
+
     if ($CheckLeak) {
         $dry_run = "the \"check leak\" testing mode";
+    }
+
+    if ($Benchmark) {
+        $dry_run = "the \"benchmark\" testing mode";
+    }
+
+    if ($Benchmark && !defined $block->no_check_leak) {
+        warn "$name\n";
+
+        my $req = $r_req_list->[0];
+        my ($nreqs, $concur);
+        if ($Benchmark =~ /^\s*(\d+)(?:\s+(\d+))?\s*$/) {
+            ($nreqs, $concur) = ($1, $2);
+        }
+
+        if ($BenchmarkWarmup) {
+            my $cmd = gen_ab_cmd_from_req($block, $req, $BenchmarkWarmup, $concur);
+            warn "Warming up with $BenchmarkWarmup requests...\n";
+            system @$cmd;
+        }
+
+        my $cmd = gen_ab_cmd_from_req($block, $req, $nreqs, $concur);
+        $cmd = quote_sh_args($cmd);
+
+        warn "$cmd\n";
+        system "unbuffer $cmd > /dev/stderr";
     }
 
     if ($CheckLeak && !defined $block->no_check_leak) {
         warn "$name\n";
 
         my $req = $r_req_list->[0];
-        my $cmd = gen_cmd_from_req($block, $req);
+        my $cmd = gen_ab_cmd_from_req($block, $req);
 
         # start a sub-process to run ab or weighttp
         my $pid = fork();
@@ -639,10 +698,14 @@ again:
             check_error_code($block, $res, $dry_run, $req_idx, $need_array);
             check_raw_response_headers($block, $raw_headers, $dry_run, $req_idx, $need_array);
             check_response_headers($block, $res, $raw_headers, $dry_run, $req_idx, $need_array);
-            check_response_body($block, $res, $dry_run, $req_idx, $need_array);
+            check_response_body($block, $res, $dry_run, $req_idx, $repeated_req_idx, $need_array);
         }
 
         if ($n || $req_idx < @$r_req_list - 1) {
+            if ($block->wait) {
+                sleep($block->wait);
+            }
+
             check_error_log($block, $res, $dry_run, $repeated_req_idx, $need_array);
         }
 
@@ -899,6 +962,7 @@ sub check_error_log ($$$$) {
 
     my $check_alert_message = 1;
     my $check_crit_message = 1;
+    my $check_emerg_message = 1;
 
     my $grep_pat;
     my $grep_pats = $block->grep_error_log;
@@ -965,6 +1029,10 @@ sub check_error_log ($$$$) {
             undef $check_crit_message;
         }
 
+        if (value_contains($pats, "[emerg")) {
+            undef $check_emerg_message;
+        }
+
         if (!ref $pats) {
             chomp $pats;
             my @lines = split /\n+/, $pats;
@@ -979,6 +1047,7 @@ sub check_error_log ($$$$) {
         }
 
         $lines ||= error_log_data();
+        #warn "error log data: ", join "\n", @$lines;
         for my $line (@$lines) {
             for my $pat (@$pats) {
                 next if !defined $pat;
@@ -1015,6 +1084,10 @@ sub check_error_log ($$$$) {
             undef $check_crit_message;
         }
 
+        if (value_contains($pats, "[emerg")) {
+            undef $check_emerg_message;
+        }
+
         if (!ref $pats) {
             chomp $pats;
             my @lines = split /\n+/, $pats;
@@ -1028,24 +1101,33 @@ sub check_error_log ($$$$) {
             $pats = \@clone;
         }
 
+        my %found;
         $lines ||= error_log_data();
         for my $line (@$lines) {
             for my $pat (@$pats) {
                 next if !defined $pat;
                 #warn "test $pat\n";
                 if ((ref $pat && $line =~ /$pat/) || $line =~ /\Q$pat\E/) {
+                    if ($found{$pat}) {
+                        my $tb = Test::More->builder;
+                        $tb->no_ending(1);
+
+                    } else {
+                        $found{$pat} = 1;
+                    }
+
                     SKIP: {
                         skip "$name - no_error_log - tests skipped due to $dry_run", 1 if $dry_run;
                         my $ln = fmt_str($line);
                         my $p = fmt_str($pat);
                         fail("$name - pattern \"$p\" should not match any line in error.log but matches line \"$ln\" (req $repeated_req_idx)");
                     }
-                    undef $pat;
                 }
             }
         }
 
         for my $pat (@$pats) {
+            next if $found{$pat};
             if (defined $pat) {
                 SKIP: {
                     skip "$name - no_error_log - tests skipped due to $dry_run", 1 if $dry_run;
@@ -1078,6 +1160,17 @@ sub check_error_log ($$$$) {
         }
     }
 
+    if ($check_emerg_message && !$dry_run) {
+        $lines ||= error_log_data();
+        for my $line (@$lines) {
+            #warn "test $pat\n";
+            if ($line =~ /\[emerg\]/) {
+                my $ln = fmt_str($line);
+                warn("WARNING: $name - $ln");
+            }
+        }
+    }
+
     for my $line (@$lines) {
         #warn "test $pat\n";
         if ($line =~ /\bAssertion .*? failed\.$/) {
@@ -1099,8 +1192,8 @@ sub fmt_str ($) {
     $str;
 }
 
-sub check_response_body ($$$$$) {
-    my ($block, $res, $dry_run, $req_idx, $need_array) = @_;
+sub check_response_body ($$$$$$) {
+    my ($block, $res, $dry_run, $req_idx, $repeated_req_idx, $need_array) = @_;
     my $name = $block->name;
     if (   defined $block->response_body
         || defined $block->response_body_eval )
@@ -1133,7 +1226,7 @@ sub check_response_body ($$$$$) {
             Encode::from_to( $expected, 'UTF-8', $block->charset );
         }
 
-        unless (ref $expected) {
+        unless (!defined $expected || ref $expected) {
             $expected =~ s/\$ServerPort\b/$ServerPort/g;
             $expected =~ s/\$ServerPortForClient\b/$ServerPortForClient/g;
         }
@@ -1144,16 +1237,16 @@ sub check_response_body ($$$$$) {
         SKIP: {
             skip "$name - response_body - tests skipped due to $dry_run", 1 if $dry_run;
             if (ref $expected) {
-                like $content, $expected, "$name - response_body - like";
+                like $content, $expected, "$name - response_body - like (req $repeated_req_idx)";
 
             } else {
                 if ($NoLongString) {
                     is( $content, $expected,
-                        "$name - response_body - response is expected" );
+                        "$name - response_body - response is expected (req $repeated_req_idx)" );
                 }
                 else {
                     is_string( $content, $expected,
-                        "$name - response_body - response is expected" );
+                        "$name - response_body - response is expected (req $repeated_req_idx)" );
                 }
             }
         }
@@ -1198,6 +1291,10 @@ sub check_response_body ($$$$$) {
             );
         }
     }
+
+    for my $check (@ResponseBodyChecks) {
+        $check->($block, $res->content, $req_idx, $repeated_req_idx, $dry_run);
+    }
 }
 
 sub parse_response($$$) {
@@ -1220,6 +1317,11 @@ sub parse_response($$$) {
 
     my $enc = $res->header('Transfer-Encoding');
     my $len = $res->header('Content-Length');
+
+    if ($code && $code !~ /^\d+$/) {
+       undef $code;
+       $res->code(undef);
+    }
 
     if ($code && ($code == 304 || $code == 101)) {
         return $res, $raw_headers
@@ -1431,13 +1533,13 @@ sub send_request ($$$$@) {
 
         #warn "doing select...\n";
 
-        my ( $new_readable, $new_writable, $new_err ) =
-          IO::Select->select( $readable_hdls, $writable_hdls, $err_hdls,
-            $timeout );
+        my ($new_readable, $new_writable, $new_err) =
+          IO::Select->select($readable_hdls, $writable_hdls, $err_hdls,
+            $timeout);
 
-        if (   !defined $new_err
+        if (!defined $new_err
             && !defined $new_readable
-            && !defined $new_writable )
+            && !defined $new_writable)
         {
 
             # timed out
@@ -1685,20 +1787,108 @@ sub read_event_handler ($) {
     return undef;
 }
 
-sub gen_cmd_from_req ($$) {
+sub gen_curl_cmd_from_req ($$) {
     my ($block, $req) = @_;
 
     my $name = $block->name;
 
     $req = join '', map { $_->{value} } @$req;
 
-    #warn "Req: $req\n";
+    #use JSON::XS;
+    #warn "Req: ",  JSON::XS->new->encode([$req]), "\n";
 
     my ($meth, $uri, $http_ver);
-    if ($req =~ m{^\s*(\w+)\s+(.*\S)\s*HTTP/(\S+)\r\n}gcs) {
+    if ($req =~ m{^\s*(\w+)\s+(\S+)\s+HTTP/(\S+)\r?\n}smig) {
         ($meth, $uri, $http_ver) = ($1, $2, $3);
 
-    } elsif ($req =~ m{^\s*(\w+)\s+(.*\S)\r\n}gcs) {
+    } elsif ($req =~ m{^\s*(\w+)\s+(.*\S)\r?\n}smig) {
+        ($meth, $uri) = ($1, $2);
+        $http_ver = '0.9';
+
+    } else {
+        bail_out "$name - cannot parse the status line in the request: $req";
+    }
+
+    my @args = ('curl', '-i');
+
+    if ($meth eq 'HEAD') {
+        push @args, '-I';
+
+    } elsif ($meth ne 'GET') {
+        warn "WARNING: --- curl: request method $meth not supported yet.\n";
+    }
+
+    if ($http_ver ne '1.1') {
+        # HTTP 1.0 or HTTP 0.9
+        push @args, '-0';
+    }
+
+    my @headers;
+    if ($http_ver ge '1.0') {
+        if ($req =~ m{\G(.*?)\r?\n\r?\n}gcs) {
+            my $headers = $1;
+            #warn "raw headers: $headers\n";
+            @headers = grep {
+                !/^Connection\s*:/i
+                && !/^Host: \Q$ServerName\E$/i
+                && !/^Content-Length\s*:/i
+            } split /\r\n/, $headers;
+
+        } else {
+            bail_out "cannot parse the header entries in the request: $req";
+        }
+    }
+
+    #warn "headers: @headers ", scalar(@headers), "\n";
+
+    for my $h (@headers) {
+        #warn "h: $h\n";
+        if ($h =~ /^\s*User-Agent\s*:\s*(.*\S)/i) {
+            push @args, '-A', $1;
+
+        } else {
+            push @args, '-H', $h;
+        }
+    }
+
+    if ($req =~ m{\G.+}gcs) {
+        warn "WARNING: --- curl: request body not supported.\n";
+    }
+
+    my $link;
+    {
+        my $server = $ServerAddr;
+        my $port = $ServerPortForClient;
+        $link = "http://$server:$port$uri";
+    }
+
+    push @args, $link;
+
+    return \@args;
+}
+
+sub gen_ab_cmd_from_req ($$@) {
+    my ($block, $req, $nreqs, $concur) = @_;
+
+    $nreqs ||= 100000;
+    $concur ||= 2;
+
+    if ($nreqs < $concur) {
+        $concur = $nreqs;
+    }
+
+    my $name = $block->name;
+
+    $req = join '', map { $_->{value} } @$req;
+
+    #use JSON::XS;
+    #warn "Req: ",  JSON::XS->new->encode([$req]), "\n";
+
+    my ($meth, $uri, $http_ver);
+    if ($req =~ m{^\s*(\w+)\s+(\S+)\s+HTTP/(\S+)\r?\n}smig) {
+        ($meth, $uri, $http_ver) = ($1, $2, $3);
+
+    } elsif ($req =~ m{^\s*(\w+)\s+(.*\S)\r?\n}smig) {
         ($meth, $uri) = ($1, $2);
         $http_ver = '0.9';
 
@@ -1708,7 +1898,7 @@ sub gen_cmd_from_req ($$) {
 
     #warn "HTTP version: $http_ver\n";
 
-    my @opts = ('-c2', '-k', '-n100000');
+    my @opts = ("-c$concur", '-k', "-n$nreqs");
 
     my $prog;
     if ($http_ver eq '1.1' && $meth eq 'GET') {
@@ -1722,7 +1912,7 @@ sub gen_cmd_from_req ($$) {
 
     my @headers;
     if ($http_ver ge '1.0') {
-        if ($req =~ m{\G(.*?)\r\n\r\n}gcs) {
+        if ($req =~ m{\G(.*?)\r?\n\r?\n}gcs) {
             my $headers = $1;
             #warn "raw headers: $headers\n";
             @headers = grep {
@@ -1768,6 +1958,9 @@ sub gen_cmd_from_req ($$) {
 
         } elsif ($meth eq 'POST') {
             push @opts, '-p', $bodyfile;
+
+        } elsif ($meth eq 'GET') {
+            warn "WARNING: method $meth not supported for ab when taking a request body\n";
 
         } else {
             warn "WARNING: method $meth not supported for ab when taking a request body\n";
@@ -1924,7 +2117,7 @@ Other configuration Perl functions I<must> be called before calling this C<run_t
 =head2 no_shuffle
 
 By default, the test scaffold always shuffles the order of the test blocks automatically. Calling this function before
-calling C<run_tests> will disable the suffling.
+calling C<run_tests> will disable the shuffling.
 
 =head2 no_long_string
 
@@ -1982,6 +2175,82 @@ Make C<--- error_log> and C<--- no_error_log> check accumulated error log across
 By default, the Nginx configuration file generated by the test scaffold
 automatically emits a C<location />. Calling this function before C<run_tests()>
 disables this behavior such that the test blocks can have their own root locations.
+
+=head2 bail_out
+
+Aborting the whole test session (not just the current test file) with a specified message.
+
+This function will also do all the necessary cleanup work. So always use this function instead of calling C<Test::More::BAIL_OUT()> directly.
+
+For example,
+
+    bail_out("something bad happened!");
+
+=head2 add_cleanup_handler
+
+Rigister custom cleanup handler for the current perl/prove process by specifying a Perl subroutine object as the argument.
+
+For example,
+
+    add_cleanup_handler(sub {
+        kill INT => $my_own_child_pid;
+        $my_own_socket->close()
+    });
+
+=head2 add_block_preprocessor
+
+Add a custom Perl preprocessor to each test block by specifying a Perl subroutine object as the argument.
+
+The processor subroutine is always run right before processing the test block.
+
+This mechanism can be used to add custom sections or modify existing ones.
+
+For example,
+
+    add_block_preprocessor(sub {
+        my $block = shift;
+
+        # use "--- req_headers" for "--- more_Headers":
+        $block->set_value("more_headers", $block->req_headers);
+
+        # initialize external dependencies like memcached services...
+    });
+
+=head2 add_response_body_check
+
+Add custom checks for testing response bodies by specifying a Perl subroutine object as the argument.
+
+Below is an example for doing HTML title checks:
+
+    add_response_body_check(sub {
+            my ($block, $body, $req_idx, $repeated_req_idx, $dry_run) = @_;
+
+            my $name = $block->name;
+            my $expected_title = $block->resp_title;
+
+            if ($expected_title && !ref $expected_title) {
+                $expected_title =~ s/^\s*|\s*$//gs;
+            }
+
+            if (defined $expected_title) {
+                SKIP: {
+                    skip "$name - resp_title - tests skipped due to $dry_run", 1 if $dry_run;
+
+                    my $title;
+                    if ($body =~ m{<\s*title\s*>\s*(.*?)<\s*/\s*title\s*>}) {
+                        $title = $1;
+                        $title =~ s/\s*$//s;
+                    }
+
+                    is_str($title, $expected_title,
+                           "$name - resp_title (req $repeated_req_idx)" );
+                }
+            }
+        });
+
+=head2 is_str
+
+Performs intelligent string comparison subtests which honors both C<no_long_string> and regular expression references in the "expected" argument.
 
 =head1 Sections supported
 
@@ -2043,6 +2312,15 @@ variable expansion (variables have to start with TEST_NGINX).
 Similar to C<main_config>, but the content will be put I<after> the C<http {}>
 block generated by this module.
 
+=head2 server_name
+
+Specify a custom server name (via the "server_name" nginx config directive) for the
+current test block. Default to "localhost".
+
+=head2 init
+
+Run a piece of Perl code specified as the content of this C<--- init> section before running the tests for the blocks. Note that it is only run once before *all* the repeated requests for this test block.
+
 =head2 request
 
 This is probably the most important section. It defines the request(s) you
@@ -2065,7 +2343,7 @@ web server and even use a different version of HTTP. This is possible:
 
 Please note that specifying HTTP/1.0 will not prevent Test::Nginx from
 sending the C<Host> header. Actually Test::Nginx always sends 2 headers:
-C<Host> (with value localhost) and C<Connection> (with value Close for
+C<Host> (with value localhost) and C<Connection> (with value C<close> for
 simple requests and keep-alive for all but the last pipelined_requests).
 
 You can also add a content to your request:
@@ -2109,7 +2387,7 @@ your request into network packets:
 Here, Test::Nginx will first send the request line, the headers it
 automatically added for you and the first two letters of the body ("na" in
 our example) in ONE network packet. Then, it will send the next packet (here
-it's "me=foo"). When we talk about packets here, this is nto exactly correct
+it's "me=foo"). When we talk about packets here, this is not exactly correct
 as there is no way to guarantee the behavior of the TCP/IP stack. What
 Test::Nginx can guarantee is that this will result in two calls to
 C<syswrite>.
@@ -2129,6 +2407,13 @@ Of course, everything can be combined till your brain starts boiling ;) :
     ".substr($val, 0, 6),
     {value => substr($val, 6, 5), delay_before=>5},
     substr($val, 11)],  "GET /rrd/foo"]
+
+Adding comments before the actual request spec is also supported, for example,
+
+   --- request
+   # this request contains the URI args
+   # "foo" and "bar":
+   GET /api?foo=1&bar=2
 
 =head2 request_eval
 
@@ -2186,6 +2471,28 @@ Adds the content of this section as headers to the request being sent. Example:
 This will add C<X-Foo: blah> to the request (on top of the automatically
 generated headers like C<Host>, C<Connection> and potentially
 C<Content-Length>).
+
+=head2 curl
+
+When this section is specified, the test scaffold will try generating a C<curl> command line for the (first) test request.
+
+For example,
+
+    --- request
+    GET /foo/bar?baz=3
+
+    --- more_headers
+    X-Foo: 3
+    User-Agent: openresty
+
+    --- curl
+
+will produce the following line (to C<stderr>) while running this test block:
+
+    # curl -i -H 'X-Foo: 3' -A openresty 'http://127.0.0.1:1984/foo/bar?baz=3'
+
+You need to remember to set the C<TEST_NGINX_NO_CLEAN> environment to 1 to prevent the nginx
+and other processes from quitting automatically upon test exits.
 
 =head2 response_body
 
@@ -2345,6 +2652,12 @@ An optional time unit can be specified, for example,
 
 Acceptable time units are C<s> (seconds) and C<ms> (milliseconds). If no time unit is specified, then default to seconds.
 
+=head2 error_log_file
+
+Specify the global error log file for the current test block only.
+
+Right now, it will not affect the C<--- error_log> section and etc accordingly.
+
 =head2 error_log
 
 Checks if the pattern or multiple patterns all appear in lines of the F<error.log> file.
@@ -2387,7 +2700,7 @@ Makes the test scaffold not to treat C<--- timeout> expiration as a test failure
 
 =head2 shutdown
 
-Perform a C<shutdown>() operaton on the client socket connecting to Nginx as soon as sending out
+Perform a C<shutdown>() operation on the client socket connecting to Nginx as soon as sending out
 all the request data. This section takes an (optional) integer value for the argument to the
 C<shutdown> function call. For example,
 
@@ -2464,13 +2777,13 @@ The default error log level can be specified in the Perl code by calling the C<l
 =head2 raw_request
 
 The exact request to send to nginx. This is useful when you want to test
-soem behaviors that are not available with "request" such as an erroneous
+some behaviors that are not available with "request" such as an erroneous
 C<Content-Length> header or splitting packets right in the middle of headers:
 
     --- raw_request eval
     ["POST /rrd/taratata HTTP/1.1\r
     Host: localhost\r
-    Connection: Close\r
+    Connection: close\r
     Content-Type: application/",
     "x-www-form-urlencoded\r
     Content-Length:15\r\n\r\nvalue=N%3A12345"]
@@ -2516,6 +2829,29 @@ html directory of the nginx server under test. For example:
 
 will create a file named C<blah.txt> in the html directory of the nginx
 server tested. The file will contain the text "Hello, world".
+
+Multiple files are supported, for example,
+
+    --- user_files
+    >>> foo.txt
+    Hello, world!
+    >>> bar.txt
+    Hello, heaven!
+
+An optional last modified timestamp (in elpased seconds since Epoch) is supported, for example,
+
+    --- user_files
+    >>> blah.txt 199801171935.33
+    Hello, world
+
+It's also possible to specify a Perl data structure for the user files
+to be created, for example,
+
+    --- user_files eval
+    [
+        [ "foo.txt" => "Hello, world!", 199801171935.33 ],
+        [ "bar.txt" => "Hello, heaven!" ],
+    ]
 
 =head2 skip_eval
 
@@ -2566,7 +2902,7 @@ the skip condition. If you want to use two boolean expressions, you should use t
 
 =head2 skip_nginx2
 
-This seciton is similar to C<skip_nginx>, but the skip condition consists of two boolean expressions joined by the operator C<and> or C<or>.
+This section is similar to C<skip_nginx>, but the skip condition consists of two boolean expressions joined by the operator C<and> or C<or>.
 
 The format for this section is
 
@@ -2658,7 +2994,7 @@ will be expanded to
 
 =head2 stap_out
 
-This seciton specifies the expected literal output of the systemtap script specified by C<stap>.
+This section specifies the expected literal output of the systemtap script specified by C<stap>.
 
 =head2 stap_out_like
 
@@ -2671,7 +3007,7 @@ Just like C<stap_like>, but the subtest only passes when the specified pattern d
 =head2 wait
 
 Takes an integer value for the seconds of time to wait right after processing the Nginx response and
-before performing the error log and systemtap output checks.
+before performing the error log and/or systemtap output checks.
 
 =head2 udp_listen
 
@@ -2728,10 +3064,27 @@ This section specifies the datagram reply content for the UDP server created by 
 
 You can also specify a delay time before sending out the reply via the C<udp_reply_delay> section. By default, there is no delay.
 
-An array value can be specified to make the embedded UDP server to send mulitple replies as specified, for example:
+An array value can be specified to make the embedded UDP server to send multiple replies as specified, for example:
 
     --- udp_reply eval
     [ "hello", "world" ]
+
+This section also accepts a Perl subroutine value that can be used to
+generate dynamic response packet or packets based on the actualactual query, for example:
+
+    --- udp_reply eval
+    sub {
+        my $req = shift;
+        return "hello, $req";
+    }
+
+The custom Perl subroutine can also return an array reference, for example,
+
+    --- udp_reply eval
+    sub {
+        my $req = shift;
+        return ["hello, $req", "hiya, $req"];
+    }
 
 See the C<udp_listen> section for more details.
 
@@ -2803,6 +3156,12 @@ Just like C<udp_query>, but for the embedded TCP server.
 
 Specifies the expected TCP query received by the embedded TCP server.
 
+If C<tcp_query> is specified, C<tcp_query_len> defaults to the length of the value of C<tcp_query>.
+
+=head2 tcp_shutdown
+
+Shuts down the reading part, writing part, or both in the embedded TCP server as soon as a new connection is established. Its value specifies which part to shut down: 0 for read part only, 1 for write part only, and 2 for both directions.
+
 =head2 raw_request_middle_delay
 
 Delay in sec between sending successive packets in the "raw_request" array
@@ -2813,6 +3172,36 @@ value. Also used when a request is split in packets.
 Skip the tests in the current test block in the "check leak" testing mode
 (i.e, with C<TEST_NGINX_CHECK_LEAK>=1).
 
+=head2 must_die
+
+Test the cases that Nginx must die right after starting. If a value is specified, the exit code must match the specified value.
+
+Normal request and response cycle is not done. But you can still use the
+C<error_log> section to check if there is an error message to be seen.
+
+This is meant to test bogus configuration is noticed and given proper
+error message. It is normal to see stderr error message when running these tests.
+
+Below is an example:
+
+    === TEST 1: bad "return" directive
+    --- config
+        location = /t {
+            return a b c;
+        }
+    --- request
+        GET /t
+    --- must_die
+    --- error_log
+    invalid number of arguments in "return" directive
+    --- no_error_log
+    [error]
+
+This configuration ignores C<TEST_NGINX_USE_VALGRIND>
+C<TEST_NGINX_USE_STAP> or C<TEST_NGINX_CHECK_LEAK> since there is no point to check other things when the nginx is expected to die right away.
+
+This directive is handled before checking C<TEST_NGINX_IGNORE_MISSING_DIRECTIVES>.
+
 =head1 Environment variables
 
 All environment variables starting with C<TEST_NGINX_> are expanded in the
@@ -2822,6 +3211,41 @@ starts. The following environment variables are supported by this module:
 =head2 TEST_NGINX_VERBOSE
 
 Controls whether to output verbose debugging messages in Test::Nginx. Default to empty.
+
+=head2 TEST_NGINX_BENCHMARK
+
+When set to an non-empty and non-zero value, then the test scaffold enters the benchmarking testing mode by invoking C<weighttp> (for HTTP 1.1 requests) and C<ab> (for HTTP 1.0 requests)
+to run each test case with the test request repeatedly.
+
+When specifying a positive number as the value, then this number is used for the total number of repeated requests. For example,
+
+    export TEST_NGINX_BENCHMARK=1000
+
+will result in 1000 repeated requests for each test block. Default to C<100000>.
+
+When a second number is specified (separated from the first number by spaces), then this second number is used for the concurrency level for the benchmark. For example,
+
+    export TEST_NGINX_BENCHMARK='1000 10'
+
+will result in 1000 repeated requests over 10 concurrent connections for each test block. The default concurrency level is 2 (or 1 if the number of requests is 1).
+
+The "benchmark" testing mode will also output to stderr the actual "ab" or "weighttp" command line used by the test scaffold. For example,
+
+    weighttp -c2 -k -n2000 -H 'Host: foo.com' http://127.0.0.1:1984/t
+
+See also the C<TEST_NGINX_BENCHMARK_WARMUP> environment.
+
+This testing mode requires the C<unbuffer> command-line utility from the C<expect> package.
+
+=head2 TEST_NGINX_BENCHMARK_WARMUP
+
+Specify the number of "warm-up" requests performed before the actual benchmark requests for each test block.
+
+The latencies of the warm-up requests never get included in the final benchmark results.
+
+Only meaningful in the "benchmark" testing mode.
+
+See also the C<TEST_NGINX_BENCHMARK> environment.
 
 =head2 TEST_NGINX_CHECK_LEAK
 
@@ -2887,8 +3311,8 @@ Test blocks carrying the "--- no_check_leak" directive will be skipped in this t
 When set to 1, the test scaffold will try to send C<HUP> signal to the
 Nginx master process to reload the config file between
 successive test blocks (but not successive C<repeast_each>
-sub-tests within the same test block). When this envirnoment is set
-to 1, it will also enfornce the "master_process on" config line
+sub-tests within the same test block). When this environment is set
+to 1, it will also enforce the "master_process on" config line
 in the F<nginx.conf> file,
 because Nginx is buggy in processing HUP signal when the master process is off.
 
@@ -2916,7 +3340,7 @@ against an already configured (and running) nginx server.
 
 =head2 TEST_NGINX_NO_SHUFFLE
 
-Dafaults to 0. If set to 1, will make sure the tests are run in the order
+Defaults to 0. If set to 1, will make sure the tests are run in the order
 they appear in the test file (and not in random order).
 
 =head2 TEST_NGINX_USE_VALGRIND
@@ -2970,7 +3394,7 @@ then C<1984> is used. See below for typical use.
 
 =head2 TEST_NGINX_CLIENT_PORT
 
-Value of the port Test::Nginx will diirect requests to. If not
+Value of the port Test::Nginx will direct requests to. If not
 set, C<TEST_NGINX_PORT> is used. If C<TEST_NGINX_PORT> is not set,
 then C<1984> is used. A typical use of this feature is to test extreme
 network conditions by adding a "proxy" between Test::Nginx and nginx
@@ -3102,7 +3526,17 @@ If you want a commit bit, feel free to drop me a line.
 =head1 DEBIAN PACKAGES
 
 António P. P. Almeida is maintaining a Debian package for this module
-in his Debian repository: http://debian.perusio.net
+in his Debian repository: L<http://debian.perusio.net>
+
+=head1 Community
+
+=head2 English Mailing List
+
+The C<openresty-en> mailing list is for English speakers: L<https://groups.google.com/group/openresty-en>
+
+=head2 Chinese Mailing List
+
+The C<openresty> mailing list is for Chinese speakers: L<https://groups.google.com/group/openresty>
 
 =head1 AUTHORS
 

@@ -4,7 +4,7 @@ use lib 'lib';
 use lib 'inc';
 use Test::Base -Base;
 
-our $VERSION = '0.23';
+our $VERSION = '0.24';
 
 our $NoLongString;
 
@@ -477,7 +477,7 @@ agentzh (章亦春) C<< <agentzh@gmail.com> >>
 
 =head1 COPYRIGHT & LICENSE
 
-Copyright (c) 2009-2012, agentzh C<< <agentzh@gmail.com> >>.
+Copyright (c) 2009-2014, agentzh C<< <agentzh@gmail.com> >>.
 
 This module is licensed under the terms of the BSD license.
 
